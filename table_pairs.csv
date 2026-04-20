@@ -1,0 +1,4 @@
+pair_name,original_table,refactor_table
+MS06,default.ca_ms06_original_temp,default.ca_ms06_refactor_temp
+MS06_V2,default.ca_ms06_original_temp,default.ca_ms06_refactor_v2_temp
+MS07,default.ca_ms07_original_temp,default.ca_ms07_refactor_temp
