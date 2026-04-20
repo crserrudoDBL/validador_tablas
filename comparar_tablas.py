@@ -55,6 +55,36 @@ def write_stderr_line(message):
         sys.stderr.write(line.encode("utf-8", "replace"))
 
 
+def write_stdout_line(message):
+    line = to_text(message) + u"\n"
+    try:
+        sys.stdout.write(line)
+    except Exception:
+        # Python 2 stdout may be bytes-only under some console encodings.
+        sys.stdout.write(line.encode("utf-8", "replace"))
+
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def log_info(message):
+    write_stdout_line("INFO [{0}] {1}".format(now_utc_iso(), to_text(message)))
+
+
+def log_warn(message):
+    write_stdout_line("WARN [{0}] {1}".format(now_utc_iso(), to_text(message)))
+
+
+def preview_command(cmd, max_len=280):
+    parts = [to_text(chunk) for chunk in cmd]
+    command_text = " ".join(parts)
+    if len(command_text) <= max_len:
+        return command_text
+    return command_text[:max_len] + " ...[truncado]"
+
+
 def decode_csv_row(raw_row):
     if sys.version_info[0] >= 3:
         return raw_row
@@ -95,14 +125,16 @@ def ensure_parent_dir(path):
         os.makedirs(parent)
 
 
-def run_command(cmd):
-    result = run_command_timed(cmd)
+def run_command(cmd, step_name=""):
+    result = run_command_timed(cmd, step_name=step_name)
     return result["returncode"], result["stdout"], result["stderr"]
 
 
-def run_command_timed(cmd):
+def run_command_timed(cmd, step_name=""):
     started_epoch = time.time()
     started_at_utc = now_utc_iso()
+    label = step_name or "command"
+    log_info("START {0}: {1}".format(label, preview_command(cmd)))
 
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -122,6 +154,9 @@ def run_command_timed(cmd):
     out = decode_if_bytes(out)
     err = decode_if_bytes(err)
 
+    elapsed_sec = ended_epoch - started_epoch
+    log_info("END {0}: exit_code={1} elapsed={2:.3f}s".format(label, proc.returncode, elapsed_sec))
+
     return {
         "cmd": list(cmd),
         "returncode": proc.returncode,
@@ -129,36 +164,44 @@ def run_command_timed(cmd):
         "stderr": err,
         "started_at_utc": started_at_utc,
         "ended_at_utc": ended_at_utc,
-        "elapsed_sec": ended_epoch - started_epoch,
+        "elapsed_sec": elapsed_sec,
     }
 
 
-def run_impala_file(sql_file, impala_shell, impala_opts):
+def run_impala_file(sql_file, impala_shell, impala_opts, step_name=""):
     cmd = [impala_shell]
     if impala_opts:
         cmd.extend(shlex.split(impala_opts))
     cmd.extend(["-f", sql_file])
-    return run_command(cmd)
+    label = step_name or "impala_file:{0}".format(sql_file)
+    return run_command(cmd, step_name=label)
 
 
-def run_impala_file_timed(sql_file, impala_shell, impala_opts, show_profiles=False):
+def run_impala_file_timed(sql_file, impala_shell, impala_opts, show_profiles=False, step_name=""):
     cmd = [impala_shell]
     if impala_opts:
         cmd.extend(shlex.split(impala_opts))
     if show_profiles:
         cmd.append("--show_profiles")
     cmd.extend(["-f", sql_file])
-    return run_command_timed(cmd)
+    label = step_name or "impala_file:{0}".format(sql_file)
+    return run_command_timed(cmd, step_name=label)
 
 
-def run_impala_query_timed(query, impala_shell, impala_opts, show_profiles=False):
+def run_impala_query_timed(query, impala_shell, impala_opts, show_profiles=False, step_name=""):
     cmd = [impala_shell]
     if impala_opts:
         cmd.extend(shlex.split(impala_opts))
     if show_profiles:
         cmd.append("--show_profiles")
     cmd.extend(["-q", query])
-    return run_command_timed(cmd)
+    default_step = "impala_query"
+    if query:
+        compact = re.sub(r"\s+", " ", query).strip()
+        if compact:
+            default_step = "impala_query:{0}".format(compact[:60])
+    label = step_name or default_step
+    return run_command_timed(cmd, step_name=label)
 
 
 def resolve_impala_shell_command(command):
@@ -401,6 +444,8 @@ def walk_json(node):
 
 
 def fetch_json(url, timeout_sec):
+    started = time.time()
+    log_info("START impala_api_request: url={0} timeout={1}s".format(url, timeout_sec))
     request = Request(url)
     request.add_header("Accept", "application/json")
     response = urlopen(request, timeout=timeout_sec)
@@ -411,6 +456,7 @@ def fetch_json(url, timeout_sec):
             response.close()
 
     payload = decode_if_bytes(payload)
+    log_info("END impala_api_request: url={0} elapsed={1:.3f}s".format(url, time.time() - started))
     return json.loads(payload)
 
 
@@ -778,14 +824,19 @@ def print_metrics_summary(metrics_rows):
 
 def build_rows_from_pairs_csv(args):
     rows = []
+    log_info("Leyendo archivo de pares: {0}".format(args.pairs))
     with open_csv_reader(args.pairs) as f:
         reader = csv.DictReader(f)
+        pair_count = 0
         for raw_row in reader:
             row = decode_csv_row(raw_row)
             pair_name = row["pair_name"].strip()
             original_table = quote_ident(row["original_table"])
             refactor_table = quote_ident(row["refactor_table"])
             key_columns = split_list(row.get("key_columns", ""))
+
+            pair_count += 1
+            log_info("Procesando par #{0}: {1}".format(pair_count, pair_name or "(sin_nombre)"))
 
             if not pair_name or not original_table or not refactor_table:
                 raise ValueError("Cada fila debe tener pair_name, original_table y refactor_table.")
@@ -810,6 +861,8 @@ def build_rows_from_pairs_csv(args):
 
             rows.append((pair_name, original_table, refactor_table, key_columns, common_cols))
 
+            log_info("Total de pares cargados: {0}".format(len(rows)))
+
     return rows
 
 
@@ -819,7 +872,7 @@ def run_describe(table_name, impala_shell, impala_opts):
         cmd.extend(shlex.split(impala_opts))
     cmd.extend(["-B", "--quiet", "--output_delimiter=,", "-q", "DESCRIBE {0}".format(table_name)])
 
-    returncode, stdout, stderr = run_command(cmd)
+    returncode, stdout, stderr = run_command(cmd, step_name="describe_table:{0}".format(table_name))
     if returncode != 0:
         raise RuntimeError(
             "No se pudo ejecutar DESCRIBE para {0}.\n"
@@ -1025,27 +1078,35 @@ def main():
     else:
         use_sql_mode = has_original_sql and has_refactor_sql
 
+    log_info("Modo de ejecucion seleccionado: {0}".format("sql" if use_sql_mode else "pairs"))
+
     output_path = args.output
     temp_tables = []
     metrics_rows = []
 
     impala_web_url = args.impala_web_url.strip() or infer_impala_web_url(args.impala_opts)
     if impala_web_url:
-        print("INFO: metricas API habilitadas via {0}".format(impala_web_url))
+        log_info("metricas API habilitadas via {0}".format(impala_web_url))
     else:
-        print("INFO: metricas API no configuradas; se usara wall-clock y fallback de PROFILE cuando exista.")
+        log_info("metricas API no configuradas; se usara wall-clock y fallback de PROFILE cuando exista.")
 
     execute_generated_sql = args.run or use_sql_mode
+    log_info("Ejecucion de SQL generado: {0}".format("si" if execute_generated_sql else "no"))
 
     try:
         if use_sql_mode:
+            log_info("Iniciando modo SQL con archivos: original={0}, refactor={1}".format(args.original_sql, args.refactor_sql))
             key_columns = split_list(args.key_columns)
             pair_name = args.pair_name.strip() or "sql_file_pair"
 
             original_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "original")
             refactor_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "refactor")
+            log_info("Tabla temporal original: {0}".format(original_table))
+            log_info("Tabla temporal refactor: {0}".format(refactor_table))
 
+            log_info("Cargando y validando query SQL original")
             original_query = load_sql_query_for_ctas(args.original_sql)
+            log_info("Cargando y validando query SQL refactor")
             refactor_query = load_sql_query_for_ctas(args.refactor_sql)
 
             create_original_sql = "CREATE TABLE {0} AS {1}".format(original_table, original_query)
@@ -1054,6 +1115,7 @@ def main():
                 args.impala_shell,
                 args.impala_opts,
                 show_profiles=True,
+                step_name="create_original_temp_table",
             )
             metrics_rows.append(
                 build_step_metrics(
@@ -1074,6 +1136,7 @@ def main():
                 args.impala_shell,
                 args.impala_opts,
                 show_profiles=True,
+                step_name="create_refactor_temp_table",
             )
             metrics_rows.append(
                 build_step_metrics(
@@ -1088,6 +1151,7 @@ def main():
                 raise RuntimeError(format_impala_error("CREATE TABLE refactor", create_refactor_result))
             temp_tables.append(refactor_table)
 
+            log_info("Descubriendo columnas via DESCRIBE para tablas temporales")
             cols_a = run_describe(original_table, args.impala_shell, args.impala_opts)
             cols_b = run_describe(refactor_table, args.impala_shell, args.impala_opts)
             common_cols = shared_columns(cols_a, cols_b)
@@ -1108,6 +1172,7 @@ def main():
 
             rows = [(pair_name, original_table, refactor_table, key_columns, common_cols)]
         else:
+            log_info("Iniciando modo pairs con CSV: {0}".format(args.pairs))
             rows = build_rows_from_pairs_csv(args)
 
         sql_parts = [
@@ -1122,14 +1187,16 @@ def main():
 
         ensure_parent_dir(output_path)
         write_text_file(output_path, "\n".join(sql_parts))
-        print("OK: SQL generado en {0}".format(output_path))
+        log_info("SQL generado en {0}".format(output_path))
 
         if execute_generated_sql:
+            log_info("Ejecutando SQL de comparacion en Impala")
             compare_result = run_impala_file_timed(
                 output_path,
                 args.impala_shell,
                 args.impala_opts,
                 show_profiles=True,
+                step_name="execute_comparison_sql",
             )
             metrics_rows.append(
                 build_step_metrics(
@@ -1148,13 +1215,14 @@ def main():
             if compare_result["returncode"] != 0:
                 raise RuntimeError(format_impala_error("ejecucion SQL de comparacion", compare_result))
 
-            print("OK: SQL ejecutado en Impala.")
+            log_info("SQL ejecutado en Impala")
             if args.result_output:
-                print("OK: Resultado guardado en {0}".format(args.result_output))
+                log_info("Resultado guardado en {0}".format(args.result_output))
         else:
-            print("INFO: SQL no ejecutado (usa --run).")
+            log_info("SQL no ejecutado (usa --run)")
     finally:
         if use_sql_mode and temp_tables:
+            log_info("Iniciando cleanup de tablas temporales")
             cleanup_errors = []
             for temp_table in temp_tables:
                 drop_sql = "DROP TABLE IF EXISTS {0}".format(temp_table)
@@ -1163,6 +1231,7 @@ def main():
                     args.impala_shell,
                     args.impala_opts,
                     show_profiles=False,
+                    step_name="drop_temp_table:{0}".format(temp_table),
                 )
                 metrics_rows.append(
                     build_step_metrics(
@@ -1177,20 +1246,20 @@ def main():
                     cleanup_errors.append(format_impala_error("DROP TABLE {0}".format(temp_table), drop_result))
 
             if cleanup_errors:
-                print("WARN: hubo errores en cleanup de temporales:")
+                log_warn("hubo errores en cleanup de temporales")
                 for err in cleanup_errors:
-                    print(err)
+                    write_stdout_line(err)
             else:
-                print("OK: tablas temporales eliminadas.")
+                log_info("tablas temporales eliminadas")
 
         try:
             print_metrics_summary(metrics_rows)
             if args.metrics_json:
                 ensure_parent_dir(args.metrics_json)
                 write_text_file(args.metrics_json, json.dumps(metrics_rows, indent=2, sort_keys=True))
-                print("OK: metricas guardadas en {0}".format(args.metrics_json))
+                log_info("metricas guardadas en {0}".format(args.metrics_json))
         except Exception as exc:
-            print("WARN: no se pudieron emitir metricas: {0}".format(exc))
+            log_warn("no se pudieron emitir metricas: {0}".format(exc))
 
 
 if __name__ == "__main__":
