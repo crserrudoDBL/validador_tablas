@@ -21,6 +21,9 @@ except ImportError:
 
 
 QUERY_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16}:[0-9a-fA-F]{16})")
+DEFAULT_SAMPLE_SIZE = 50
+DEFAULT_HUMAN_REPORT_PATH = "comparison_report.txt"
+SAMPLE_VALUE_SEPARATOR = " ||| "
 
 try:
     text_type = unicode  # type: ignore[name-defined]
@@ -168,19 +171,23 @@ def run_command_timed(cmd, step_name=""):
     }
 
 
-def run_impala_file(sql_file, impala_shell, impala_opts, step_name=""):
+def run_impala_file(sql_file, impala_shell, impala_opts, step_name="", delimited=False):
     cmd = [impala_shell]
     if impala_opts:
         cmd.extend(shlex.split(impala_opts))
+    if delimited:
+        cmd.extend(["-B", "--quiet"])
     cmd.extend(["-f", sql_file])
     label = step_name or "impala_file:{0}".format(sql_file)
     return run_command(cmd, step_name=label)
 
 
-def run_impala_file_timed(sql_file, impala_shell, impala_opts, show_profiles=False, step_name=""):
+def run_impala_file_timed(sql_file, impala_shell, impala_opts, show_profiles=False, step_name="", delimited=False):
     cmd = [impala_shell]
     if impala_opts:
         cmd.extend(shlex.split(impala_opts))
+    if delimited:
+        cmd.extend(["-B", "--quiet"])
     if show_profiles:
         cmd.append("--show_profiles")
     cmd.extend(["-f", sql_file])
@@ -188,10 +195,12 @@ def run_impala_file_timed(sql_file, impala_shell, impala_opts, show_profiles=Fal
     return run_command_timed(cmd, step_name=label)
 
 
-def run_impala_query_timed(query, impala_shell, impala_opts, show_profiles=False, step_name=""):
+def run_impala_query_timed(query, impala_shell, impala_opts, show_profiles=False, step_name="", delimited=False):
     cmd = [impala_shell]
     if impala_opts:
         cmd.extend(shlex.split(impala_opts))
+    if delimited:
+        cmd.extend(["-B", "--quiet"])
     if show_profiles:
         cmd.append("--show_profiles")
     cmd.extend(["-q", query])
@@ -822,6 +831,346 @@ def print_metrics_summary(metrics_rows):
             print("  warnings={0}".format(" | ".join(row["metric_warnings"])))
 
 
+def parse_delimited_result_rows(text, expected_cols=0):
+    rows = []
+    for raw_line in (text or "").splitlines():
+        line = to_text(raw_line).strip()
+        if not line:
+            continue
+
+        lower = line.lower()
+        if line.startswith("#") or line.startswith("+") or line.startswith("|"):
+            continue
+        if lower.startswith("starting impala shell") or lower.startswith("query:"):
+            continue
+        if lower.startswith("warning:") or lower.startswith("warn:"):
+            continue
+        if re.match(r"^fetched\s+\d+\s+row\(s\)", lower):
+            continue
+
+        if expected_cols == 1:
+            parts = [line]
+        elif expected_cols > 1:
+            if "\t" not in line:
+                continue
+            parts = line.split("\t", expected_cols - 1)
+            if len(parts) != expected_cols:
+                continue
+        else:
+            if "\t" not in line:
+                continue
+            parts = line.split("\t")
+
+        rows.append([to_text(part).strip() for part in parts])
+    return rows
+
+
+def split_sample_value(value):
+    text = to_text(value)
+    if SAMPLE_VALUE_SEPARATOR in text:
+        key_text, row_text = text.split(SAMPLE_VALUE_SEPARATOR, 1)
+        return key_text.strip(), row_text.strip()
+    return text.strip(), ""
+
+
+def parse_comparison_output(stdout_text):
+    metrics_by_pair = {}
+    samples_by_pair = {}
+
+    for pair_name, metric, value in parse_delimited_result_rows(stdout_text, expected_cols=3):
+        if not pair_name or not metric:
+            continue
+
+        metric_key = metric.strip()
+        if metric_key in ("SAMPLE_A_ONLY", "SAMPLE_B_ONLY"):
+            pair_samples = samples_by_pair.setdefault(pair_name, {"A_ONLY": [], "B_ONLY": []})
+            key_text, row_text = split_sample_value(value)
+            side = "A_ONLY" if metric_key == "SAMPLE_A_ONLY" else "B_ONLY"
+            pair_samples[side].append({"key": key_text, "row": row_text})
+            continue
+
+        pair_metrics = metrics_by_pair.setdefault(pair_name, {})
+        pair_metrics[metric_key] = value
+
+    return metrics_by_pair, samples_by_pair
+
+
+def evaluate_step1_results(rows, metrics_by_pair):
+    pair_results = []
+    all_pass = True
+
+    for row_data in rows:
+        pair_name = row_data[0]
+        metrics = metrics_by_pair.get(pair_name, {})
+
+        strict_result = to_text(metrics.get("STRICT_100_RESULT", "")).strip().upper()
+        fast_result = to_text(metrics.get("FAST_AUDIT_RESULT", "")).strip().upper()
+
+        status = "PASS" if strict_result == "OK" else "FAIL"
+        if status != "PASS":
+            all_pass = False
+
+        if strict_result:
+            reason = "STRICT_100_RESULT={0}".format(strict_result)
+        else:
+            reason = "No se encontro STRICT_100_RESULT en la salida de comparacion"
+
+        pair_results.append(
+            {
+                "pair_name": pair_name,
+                "status": status,
+                "reason": reason,
+                "strict_result": strict_result or "NO_DATA",
+                "fast_result": fast_result or "NO_DATA",
+                "metrics": metrics,
+            }
+        )
+
+    if not pair_results:
+        all_pass = False
+
+    return {
+        "status": "PASS" if all_pass else "FAIL",
+        "all_pass": all_pass,
+        "pairs": pair_results,
+        "reason": "",
+    }
+
+
+def truncate_text(value, max_len):
+    text = to_text(value)
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return text[: max_len - 3] + "..."
+
+
+def render_side_by_side_samples(pair_samples, sample_limit):
+    a_samples = (pair_samples or {}).get("A_ONLY", [])[:sample_limit]
+    b_samples = (pair_samples or {}).get("B_ONLY", [])[:sample_limit]
+
+    lines = []
+    if not a_samples and not b_samples:
+        lines.append("  No se encontraron muestras de diferencias para mostrar.")
+        return lines
+
+    col_width = 72
+    lines.append("  Muestras lado a lado (hasta {0} por lado):".format(sample_limit))
+    lines.append(
+        "  {0:<{w}} | {1:<{w}}".format(
+            "ORIGINAL (A_ONLY)",
+            "REFACTOR (B_ONLY)",
+            w=col_width,
+        )
+    )
+    lines.append("  " + ("-" * col_width) + "-+-" + ("-" * col_width))
+
+    row_total = max(len(a_samples), len(b_samples))
+    for idx in range(row_total):
+        left_text = ""
+        right_text = ""
+
+        if idx < len(a_samples):
+            left_sample = a_samples[idx]
+            left_key = truncate_text(left_sample.get("key", ""), 28)
+            left_row = truncate_text(left_sample.get("row", ""), col_width - 37)
+            left_text = "KEY={0} ROW={1}".format(left_key, left_row)
+
+        if idx < len(b_samples):
+            right_sample = b_samples[idx]
+            right_key = truncate_text(right_sample.get("key", ""), 28)
+            right_row = truncate_text(right_sample.get("row", ""), col_width - 37)
+            right_text = "KEY={0} ROW={1}".format(right_key, right_row)
+
+        lines.append("  {0:<{w}} | {1:<{w}}".format(left_text, right_text, w=col_width))
+
+    return lines
+
+
+def to_float_metric(value):
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def format_efficiency_line(label, original_value, refactor_value, formatter, lower_is_better=True):
+    original_num = to_float_metric(original_value)
+    refactor_num = to_float_metric(refactor_value)
+
+    if original_num is None or refactor_num is None:
+        return "{0}: original={1} | refactor={2} | delta=n/a | winner=n/a".format(
+            label,
+            formatter(original_num),
+            formatter(refactor_num),
+        )
+
+    delta = refactor_num - original_num
+    if original_num == 0:
+        delta_pct = "n/a"
+    else:
+        delta_pct = "{0:+.2f}%".format((delta / original_num) * 100.0)
+
+    if abs(delta) < 1e-12:
+        winner = "EMPATE"
+    elif lower_is_better:
+        winner = "REFACTOR" if delta < 0 else "ORIGINAL"
+    else:
+        winner = "REFACTOR" if delta > 0 else "ORIGINAL"
+
+    return "{0}: original={1} | refactor={2} | delta={3:+.6f} ({4}) | winner={5}".format(
+        label,
+        formatter(original_num),
+        formatter(refactor_num),
+        delta,
+        delta_pct,
+        winner,
+    )
+
+
+def build_read_only_probe_query(base_query, alias):
+    alias_name = sanitize_identifier(alias)
+    if not alias_name:
+        alias_name = "step2_probe"
+    return "SELECT cast(count(*) as bigint) AS validator_rowcount FROM ({0}) {1}".format(base_query, alias_name)
+
+
+def extract_single_value_from_result(stdout_text):
+    rows = parse_delimited_result_rows(stdout_text, expected_cols=1)
+    if not rows:
+        return ""
+
+    for row in rows:
+        candidate = row[0].strip()
+        if re.match(r"^-?[0-9]+(?:\.[0-9]+)?$", candidate):
+            return candidate
+    return rows[0][0].strip()
+
+
+def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_summary, sample_limit):
+    lines = []
+    lines.append("VALIDADOR DE QUERIES - REPORTE HUMANO")
+    lines.append("Generado: {0}".format(now_utc_iso()))
+    lines.append("Modo: {0}".format(mode_name))
+    lines.append("")
+
+    lines.append("STEP 1 - EQUIVALENCIA FUNCIONAL (regla: STRICT_100_RESULT = OK)")
+    lines.append("=" * 100)
+
+    step1_pairs = step1_summary.get("pairs", [])
+    if not step1_pairs:
+        lines.append("No se pudieron obtener metricas de comparacion para Step 1.")
+    else:
+        for pair_result in step1_pairs:
+            pair_name = pair_result.get("pair_name", "(sin_nombre)")
+            metrics = pair_result.get("metrics") or {}
+
+            lines.append("Par: {0}".format(pair_name))
+            lines.append("  Resultado: {0}".format(pair_result.get("status", "FAIL")))
+            lines.append("  Razon: {0}".format(pair_result.get("reason", "n/a")))
+            lines.append("  FAST_AUDIT_RESULT: {0}".format(pair_result.get("fast_result", "NO_DATA")))
+            lines.append("  STRICT_100_RESULT: {0}".format(pair_result.get("strict_result", "NO_DATA")))
+            lines.append(
+                "  A_total={0} | B_total={1} | A_minus_B_fullrow={2} | B_minus_A_fullrow={3}".format(
+                    metrics.get("A_total", "n/a"),
+                    metrics.get("B_total", "n/a"),
+                    metrics.get("A_minus_B_fullrow", "n/a"),
+                    metrics.get("B_minus_A_fullrow", "n/a"),
+                )
+            )
+
+            if pair_result.get("status") != "PASS":
+                pair_samples = samples_by_pair.get(pair_name, {"A_ONLY": [], "B_ONLY": []})
+                lines.extend(render_side_by_side_samples(pair_samples, sample_limit))
+
+            lines.append("")
+
+    lines.append("Resultado global Step 1: {0}".format(step1_summary.get("status", "FAIL")))
+    lines.append("")
+
+    lines.append("STEP 2 - EFICIENCIA (read-only re-ejecucion de queries)")
+    lines.append("=" * 100)
+    step2_status = step2_summary.get("status", "SKIPPED")
+    lines.append("Estado: {0}".format(step2_status))
+
+    if step2_status != "COMPLETED":
+        lines.append("Motivo: {0}".format(step2_summary.get("reason", "n/a")))
+        return "\n".join(lines)
+
+    lines.append("Metodo: SELECT COUNT(*) FROM (<query>) para ejecutar cada query en modo read-only.")
+    lines.append("Rowcount original: {0}".format(step2_summary.get("original_rowcount") or "n/a"))
+    lines.append("Rowcount refactor: {0}".format(step2_summary.get("refactor_rowcount") or "n/a"))
+
+    original_metrics = step2_summary.get("original_metrics") or {}
+    refactor_metrics = step2_summary.get("refactor_metrics") or {}
+
+    lines.append("Fuente metricas original: {0}".format(original_metrics.get("metric_source", "n/a")))
+    lines.append("Fuente metricas refactor: {0}".format(refactor_metrics.get("metric_source", "n/a")))
+    lines.append("")
+
+    lines.append(
+        format_efficiency_line(
+            "Tiempo wall-clock",
+            original_metrics.get("elapsed_wall_sec"),
+            refactor_metrics.get("elapsed_wall_sec"),
+            lambda v: "n/a" if v is None else "{0:.3f}s".format(v),
+            lower_is_better=True,
+        )
+    )
+    lines.append(
+        format_efficiency_line(
+            "Memoria pico",
+            original_metrics.get("peak_memory_bytes"),
+            refactor_metrics.get("peak_memory_bytes"),
+            lambda v: "n/a" if v is None else "{0:.2f}MB".format(v / (1024.0 * 1024.0)),
+            lower_is_better=True,
+        )
+    )
+    lines.append(
+        format_efficiency_line(
+            "CPU user promedio",
+            original_metrics.get("cpu_user_pct_avg"),
+            refactor_metrics.get("cpu_user_pct_avg"),
+            lambda v: "n/a" if v is None else "{0:.2f}%".format(v),
+            lower_is_better=True,
+        )
+    )
+    lines.append(
+        format_efficiency_line(
+            "CPU sys promedio",
+            original_metrics.get("cpu_sys_pct_avg"),
+            refactor_metrics.get("cpu_sys_pct_avg"),
+            lambda v: "n/a" if v is None else "{0:.2f}%".format(v),
+            lower_is_better=True,
+        )
+    )
+    lines.append(
+        format_efficiency_line(
+            "CPU iowait promedio",
+            original_metrics.get("cpu_iowait_pct_avg"),
+            refactor_metrics.get("cpu_iowait_pct_avg"),
+            lambda v: "n/a" if v is None else "{0:.2f}%".format(v),
+            lower_is_better=True,
+        )
+    )
+
+    warnings = []
+    warnings.extend(original_metrics.get("metric_warnings") or [])
+    warnings.extend(refactor_metrics.get("metric_warnings") or [])
+    if warnings:
+        lines.append("")
+        lines.append("Advertencias de metricas:")
+        for warning in warnings:
+            lines.append("- {0}".format(warning))
+
+    return "\n".join(lines)
+
+
 def build_rows_from_pairs_csv(args):
     rows = []
     log_info("Leyendo archivo de pares: {0}".format(args.pairs))
@@ -952,7 +1301,7 @@ def build_row_expr(columns):
     return "concat_ws('|', " + ", ".join(parts) + ")"
 
 
-def metric_block(pair_name, original_table, refactor_table, key_columns, compare_columns):
+def metric_block(pair_name, original_table, refactor_table, key_columns, compare_columns, sample_size=DEFAULT_SAMPLE_SIZE):
     a_key = build_key_expr(key_columns)
     b_key = build_key_expr(key_columns)
     a_row = build_row_expr(compare_columns)
@@ -969,6 +1318,8 @@ def metric_block(pair_name, original_table, refactor_table, key_columns, compare
     block.append("b_rows AS (SELECT __row_text, cast(count(*) as bigint) AS cnt FROM b GROUP BY __row_text),")
     block.append("ab_rows AS (SELECT cast(count(*) as bigint) AS value FROM a_rows LEFT ANTI JOIN b_rows ON a_rows.__row_text = b_rows.__row_text AND a_rows.cnt = b_rows.cnt),")
     block.append("ba_rows AS (SELECT cast(count(*) as bigint) AS value FROM b_rows LEFT ANTI JOIN a_rows ON b_rows.__row_text = a_rows.__row_text AND b_rows.cnt = a_rows.cnt),")
+    block.append("a_only_sample AS (SELECT a.__cmp_key, a.__row_text FROM a LEFT ANTI JOIN b ON a.__cmp_key = b.__cmp_key LIMIT {0}),".format(int(sample_size)))
+    block.append("b_only_sample AS (SELECT b.__cmp_key, b.__row_text FROM b LEFT ANTI JOIN a ON b.__cmp_key = a.__cmp_key LIMIT {0}),".format(int(sample_size)))
     block.append("a_hash AS (SELECT cast(coalesce(sum(cast(fnv_hash(__row_text) as bigint)), 0) as bigint) AS value FROM a),")
     block.append("b_hash AS (SELECT cast(coalesce(sum(cast(fnv_hash(__row_text) as bigint)), 0) as bigint) AS value FROM b),")
     block.append("a_total AS (SELECT cast(count(*) as bigint) AS value FROM a),")
@@ -988,6 +1339,10 @@ def metric_block(pair_name, original_table, refactor_table, key_columns, compare
     block.append("SELECT '{0}' AS pair_name, 'A_minus_B_fullrow' AS metric, cast(ab_rows.value as string) AS value FROM ab_rows".format(pair_name))
     block.append("UNION ALL")
     block.append("SELECT '{0}' AS pair_name, 'B_minus_A_fullrow' AS metric, cast(ba_rows.value as string) AS value FROM ba_rows".format(pair_name))
+    block.append("UNION ALL")
+    block.append("SELECT '{0}' AS pair_name, 'SAMPLE_A_ONLY' AS metric, concat(cast(a_only_sample.__cmp_key as string), '{1}', cast(a_only_sample.__row_text as string)) AS value FROM a_only_sample".format(pair_name, SAMPLE_VALUE_SEPARATOR))
+    block.append("UNION ALL")
+    block.append("SELECT '{0}' AS pair_name, 'SAMPLE_B_ONLY' AS metric, concat(cast(b_only_sample.__cmp_key as string), '{1}', cast(b_only_sample.__row_text as string)) AS value FROM b_only_sample".format(pair_name, SAMPLE_VALUE_SEPARATOR))
     block.append("UNION ALL")
     block.append("SELECT '{0}' AS pair_name, 'FAST_AUDIT_RESULT' AS metric, CASE WHEN a_total.value = b_total.value AND ab_key.value = 0 AND ba_key.value = 0 AND a_hash.value = b_hash.value THEN 'OK' ELSE 'DIFF' END AS value FROM a_total CROSS JOIN b_total CROSS JOIN ab_key CROSS JOIN ba_key CROSS JOIN a_hash CROSS JOIN b_hash".format(pair_name))
     block.append("UNION ALL")
@@ -1056,6 +1411,11 @@ def main():
         default="",
         help="Archivo JSON para guardar metricas por query.",
     )
+    parser.add_argument(
+        "--human-report",
+        default=DEFAULT_HUMAN_REPORT_PATH,
+        help="Archivo TXT de salida para reporte humano lado a lado.",
+    )
     parser.set_defaults(auto_columns=True)
     args = parser.parse_args()
 
@@ -1081,8 +1441,28 @@ def main():
     log_info("Modo de ejecucion seleccionado: {0}".format("sql" if use_sql_mode else "pairs"))
 
     output_path = args.output
+    report_path = (args.human_report or "").strip() or DEFAULT_HUMAN_REPORT_PATH
     temp_tables = []
     metrics_rows = []
+    rows = []
+    original_query = ""
+    refactor_query = ""
+
+    step1_summary = {
+        "status": "SKIPPED",
+        "all_pass": False,
+        "pairs": [],
+        "reason": "Step 1 aun no ejecutado",
+    }
+    step2_summary = {
+        "status": "SKIPPED",
+        "reason": "Step 2 aun no ejecutado",
+        "original_metrics": None,
+        "refactor_metrics": None,
+        "original_rowcount": "",
+        "refactor_rowcount": "",
+    }
+    comparison_samples_by_pair = {}
 
     impala_web_url = args.impala_web_url.strip() or infer_impala_web_url(args.impala_opts)
     if impala_web_url:
@@ -1183,7 +1563,16 @@ def main():
         ]
 
         for row_data in rows:
-            sql_parts.append(metric_block(row_data[0], row_data[1], row_data[2], row_data[3], row_data[4]))
+            sql_parts.append(
+                metric_block(
+                    row_data[0],
+                    row_data[1],
+                    row_data[2],
+                    row_data[3],
+                    row_data[4],
+                    sample_size=DEFAULT_SAMPLE_SIZE,
+                )
+            )
 
         ensure_parent_dir(output_path)
         write_text_file(output_path, "\n".join(sql_parts))
@@ -1195,8 +1584,9 @@ def main():
                 output_path,
                 args.impala_shell,
                 args.impala_opts,
-                show_profiles=True,
+                show_profiles=False,
                 step_name="execute_comparison_sql",
+                delimited=True,
             )
             metrics_rows.append(
                 build_step_metrics(
@@ -1212,14 +1602,107 @@ def main():
                 ensure_parent_dir(args.result_output)
                 write_text_file(args.result_output, compare_result["stdout"])
 
+            comparison_metrics_by_pair, comparison_samples_by_pair = parse_comparison_output(compare_result.get("stdout", ""))
+            step1_summary = evaluate_step1_results(rows, comparison_metrics_by_pair)
+
             if compare_result["returncode"] != 0:
+                step1_summary["status"] = "ERROR"
+                step1_summary["all_pass"] = False
+                step1_summary["reason"] = "Error ejecutando SQL de comparacion"
+                step2_summary["status"] = "SKIPPED"
+                step2_summary["reason"] = "Step 2 omitido por error de ejecucion en Step 1"
                 raise RuntimeError(format_impala_error("ejecucion SQL de comparacion", compare_result))
 
             log_info("SQL ejecutado en Impala")
             if args.result_output:
                 log_info("Resultado guardado en {0}".format(args.result_output))
+
+            if step1_summary.get("all_pass"):
+                log_info("STEP 1 PASS: STRICT_100_RESULT=OK para todos los pares")
+                if use_sql_mode:
+                    log_info("STEP 2 START: ejecucion read-only de query original y refactor")
+
+                    original_probe_sql = build_read_only_probe_query(original_query, "step2_original_probe")
+                    original_probe_result = run_impala_query_timed(
+                        original_probe_sql,
+                        args.impala_shell,
+                        args.impala_opts,
+                        show_profiles=True,
+                        step_name="step2_readonly_original",
+                        delimited=True,
+                    )
+                    original_probe_metrics = build_step_metrics(
+                        "step2_readonly_original",
+                        original_probe_result,
+                        impala_web_url,
+                        args.impala_web_timeout,
+                        allow_api=True,
+                    )
+                    metrics_rows.append(original_probe_metrics)
+                    if original_probe_result["returncode"] != 0:
+                        step2_summary["status"] = "ERROR"
+                        step2_summary["reason"] = "Fallo la ejecucion read-only de la query original"
+                        step2_summary["original_metrics"] = original_probe_metrics
+                        raise RuntimeError(format_impala_error("step2_readonly_original", original_probe_result))
+
+                    refactor_probe_sql = build_read_only_probe_query(refactor_query, "step2_refactor_probe")
+                    refactor_probe_result = run_impala_query_timed(
+                        refactor_probe_sql,
+                        args.impala_shell,
+                        args.impala_opts,
+                        show_profiles=True,
+                        step_name="step2_readonly_refactor",
+                        delimited=True,
+                    )
+                    refactor_probe_metrics = build_step_metrics(
+                        "step2_readonly_refactor",
+                        refactor_probe_result,
+                        impala_web_url,
+                        args.impala_web_timeout,
+                        allow_api=True,
+                    )
+                    metrics_rows.append(refactor_probe_metrics)
+                    if refactor_probe_result["returncode"] != 0:
+                        step2_summary["status"] = "ERROR"
+                        step2_summary["reason"] = "Fallo la ejecucion read-only de la query refactor"
+                        step2_summary["original_metrics"] = original_probe_metrics
+                        step2_summary["refactor_metrics"] = refactor_probe_metrics
+                        raise RuntimeError(format_impala_error("step2_readonly_refactor", refactor_probe_result))
+
+                    step2_summary = {
+                        "status": "COMPLETED",
+                        "reason": "",
+                        "original_metrics": original_probe_metrics,
+                        "refactor_metrics": refactor_probe_metrics,
+                        "original_rowcount": extract_single_value_from_result(original_probe_result.get("stdout", "")),
+                        "refactor_rowcount": extract_single_value_from_result(refactor_probe_result.get("stdout", "")),
+                    }
+                    log_info("STEP 2 COMPLETED: comparacion read-only finalizada")
+                else:
+                    step2_summary["status"] = "SKIPPED"
+                    step2_summary["reason"] = "Step 2 read-only solo aplica para modo sql"
+                    log_warn("STEP 2 SKIPPED: modo pairs")
+            else:
+                step1_summary["reason"] = "Al menos un par no cumple STRICT_100_RESULT=OK"
+                step2_summary["status"] = "SKIPPED"
+                step2_summary["reason"] = "Step 1 FAIL: se omite Step 2"
+                log_warn("STEP 1 FAIL: se omite Step 2")
         else:
             log_info("SQL no ejecutado (usa --run)")
+            step1_summary = {
+                "status": "SKIPPED",
+                "all_pass": False,
+                "pairs": [],
+                "reason": "No se ejecuto SQL de comparacion",
+            }
+            step2_summary = {
+                "status": "SKIPPED",
+                "reason": "Step 2 requiere que Step 1 se ejecute",
+                "original_metrics": None,
+                "refactor_metrics": None,
+                "original_rowcount": "",
+                "refactor_rowcount": "",
+            }
     finally:
         if use_sql_mode and temp_tables:
             log_info("Iniciando cleanup de tablas temporales")
@@ -1260,6 +1743,20 @@ def main():
                 log_info("metricas guardadas en {0}".format(args.metrics_json))
         except Exception as exc:
             log_warn("no se pudieron emitir metricas: {0}".format(exc))
+
+        try:
+            report_text = build_human_report_text(
+                "sql" if use_sql_mode else "pairs",
+                step1_summary,
+                comparison_samples_by_pair,
+                step2_summary,
+                DEFAULT_SAMPLE_SIZE,
+            )
+            ensure_parent_dir(report_path)
+            write_text_file(report_path, report_text)
+            log_info("reporte humano guardado en {0}".format(report_path))
+        except Exception as exc:
+            log_warn("no se pudo generar el reporte humano: {0}".format(exc))
 
 
 if __name__ == "__main__":

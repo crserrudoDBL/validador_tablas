@@ -7,6 +7,8 @@ Soporta dos modos:
 - `pairs`: compara tablas ya existentes (compatible con el flujo anterior).
 - `sql`: recibe dos archivos SQL, crea tablas temporales, compara, y elimina temporales al final.
 
+Ademas, siempre genera un reporte humano en TXT con el resultado por pasos.
+
 ## Que valida
 
 Para cada par ejecuta:
@@ -20,6 +22,19 @@ Incluye resultados por par:
 
 - `FAST_AUDIT_RESULT` (OK/DIFF)
 - `STRICT_100_RESULT` (OK/DIFF)
+
+Tambien incluye muestras de diferencias lado a lado (hasta 50 por lado) cuando hay mismatch.
+
+## Flujo de dos pasos
+
+1. **Step 1 - equivalencia funcional**
+	- Regla de exito: `STRICT_100_RESULT = OK`.
+	- Si falla, el reporte marca FAIL y muestra muestras `A_ONLY` vs `B_ONLY` en formato lado a lado.
+
+2. **Step 2 - comparacion de eficiencia (solo si Step 1 pasa)**
+	- Re-ejecuta ambas queries en modo read-only para comparar tiempo y recursos.
+	- Metodo usado: `SELECT COUNT(*) FROM (<query>)` para evitar escritura y mantener ejecucion read-only.
+	- Reporta tiempo, memoria pico y CPU (cuando hay datos).
 
 ## Modo 1: comparar tablas existentes (`pairs`)
 
@@ -55,8 +70,9 @@ En este modo el script:
 
 1. Lee `--original-sql` y `--refactor-sql` (una unica query `SELECT` por archivo; CTEs permitidas).
 2. Crea dos tablas temporales con `CREATE TABLE ... AS <query>`.
-3. Ejecuta la comparacion funcional sobre esas tablas.
-4. Hace cleanup con `DROP TABLE IF EXISTS` en ambos temporales (incluso si hay error).
+3. Ejecuta la comparacion funcional sobre esas tablas (Step 1).
+4. Si Step 1 pasa, ejecuta Step 2 en read-only con ambas queries originales.
+5. Hace cleanup con `DROP TABLE IF EXISTS` en ambos temporales (incluso si hay error).
 
 Ejemplo:
 
@@ -86,6 +102,20 @@ Fuentes de metricas:
 1. API web de Impala (preferida): `--impala-web-url` o inferida desde `--impala-opts`.
 2. Fallback: parseo best-effort del texto de profile en salida de `impala-shell`.
 
+## Reporte humano TXT
+
+Por defecto se genera `comparison_report.txt` con:
+
+- resumen de Step 1 por par (PASS/FAIL y metricas clave)
+- muestras lado a lado en caso de mismatch (`A_ONLY` vs `B_ONLY`)
+- resumen de Step 2 (si aplica) con comparacion original vs refactor
+
+Puedes cambiar la ruta de salida:
+
+```bash
+python comparar_tablas.py ... --human-report reporte_humano.txt
+```
+
 Guardar metricas en JSON:
 
 ```bash
@@ -104,6 +134,7 @@ python comparar_tablas.py ... --metrics-json metricas.json
 - `--impala-web-url`: URL base para metricas API (ej: `http://host:25000`).
 - `--impala-web-timeout`: timeout de llamadas HTTP.
 - `--metrics-json`: salida JSON de metricas.
+- `--human-report`: salida TXT legible (por defecto `comparison_report.txt`).
 
 ## Windows: error comun con impala-shell
 
