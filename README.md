@@ -33,7 +33,7 @@ Tambien incluye muestras de diferencias lado a lado (hasta 50 por lado) cuando h
 
 2. **Step 2 - comparacion de eficiencia (solo si Step 1 pasa)**
 	- Re-ejecuta ambas queries en modo read-only para comparar tiempo y recursos.
-	- Metodo usado: `SELECT COUNT(*) FROM (<query>)` para evitar escritura y mantener ejecucion read-only.
+	- Metodo usado: ejecucion directa de cada query (sin `CREATE`/`INSERT`/`DROP` en Step 2) para medir tiempo y recursos sobre la query real.
 	- Reporta tiempo, memoria pico y CPU (cuando hay datos).
 
 ## Modo 1: comparar tablas existentes (`pairs`)

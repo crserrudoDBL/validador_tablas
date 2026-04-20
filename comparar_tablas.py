@@ -1033,25 +1033,6 @@ def format_efficiency_line(label, original_value, refactor_value, formatter, low
     )
 
 
-def build_read_only_probe_query(base_query, alias):
-    alias_name = sanitize_identifier(alias)
-    if not alias_name:
-        alias_name = "step2_probe"
-    return "SELECT cast(count(*) as bigint) AS validator_rowcount FROM ({0}) {1}".format(base_query, alias_name)
-
-
-def extract_single_value_from_result(stdout_text):
-    rows = parse_delimited_result_rows(stdout_text, expected_cols=1)
-    if not rows:
-        return ""
-
-    for row in rows:
-        candidate = row[0].strip()
-        if re.match(r"^-?[0-9]+(?:\.[0-9]+)?$", candidate):
-            return candidate
-    return rows[0][0].strip()
-
-
 def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_summary, sample_limit):
     lines = []
     lines.append("VALIDADOR DE QUERIES - REPORTE HUMANO")
@@ -1102,9 +1083,10 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
         lines.append("Motivo: {0}".format(step2_summary.get("reason", "n/a")))
         return "\n".join(lines)
 
-    lines.append("Metodo: SELECT COUNT(*) FROM (<query>) para ejecutar cada query en modo read-only.")
-    lines.append("Rowcount original: {0}".format(step2_summary.get("original_rowcount") or "n/a"))
-    lines.append("Rowcount refactor: {0}".format(step2_summary.get("refactor_rowcount") or "n/a"))
+    lines.append("Metodo: ejecucion directa de cada query en modo read-only.")
+    if step2_summary.get("original_rowcount") or step2_summary.get("refactor_rowcount"):
+        lines.append("Rowcount original: {0}".format(step2_summary.get("original_rowcount") or "n/a"))
+        lines.append("Rowcount refactor: {0}".format(step2_summary.get("refactor_rowcount") or "n/a"))
 
     original_metrics = step2_summary.get("original_metrics") or {}
     refactor_metrics = step2_summary.get("refactor_metrics") or {}
@@ -1457,6 +1439,7 @@ def main():
     step2_summary = {
         "status": "SKIPPED",
         "reason": "Step 2 aun no ejecutado",
+        "method": "direct_query",
         "original_metrics": None,
         "refactor_metrics": None,
         "original_rowcount": "",
@@ -1622,17 +1605,16 @@ def main():
                 if use_sql_mode:
                     log_info("STEP 2 START: ejecucion read-only de query original y refactor")
 
-                    original_probe_sql = build_read_only_probe_query(original_query, "step2_original_probe")
                     original_probe_result = run_impala_query_timed(
-                        original_probe_sql,
+                        original_query,
                         args.impala_shell,
                         args.impala_opts,
                         show_profiles=True,
-                        step_name="step2_readonly_original",
+                        step_name="step2_readonly_original_direct",
                         delimited=True,
                     )
                     original_probe_metrics = build_step_metrics(
-                        "step2_readonly_original",
+                        "step2_readonly_original_direct",
                         original_probe_result,
                         impala_web_url,
                         args.impala_web_timeout,
@@ -1645,17 +1627,16 @@ def main():
                         step2_summary["original_metrics"] = original_probe_metrics
                         raise RuntimeError(format_impala_error("step2_readonly_original", original_probe_result))
 
-                    refactor_probe_sql = build_read_only_probe_query(refactor_query, "step2_refactor_probe")
                     refactor_probe_result = run_impala_query_timed(
-                        refactor_probe_sql,
+                        refactor_query,
                         args.impala_shell,
                         args.impala_opts,
                         show_profiles=True,
-                        step_name="step2_readonly_refactor",
+                        step_name="step2_readonly_refactor_direct",
                         delimited=True,
                     )
                     refactor_probe_metrics = build_step_metrics(
-                        "step2_readonly_refactor",
+                        "step2_readonly_refactor_direct",
                         refactor_probe_result,
                         impala_web_url,
                         args.impala_web_timeout,
@@ -1672,10 +1653,11 @@ def main():
                     step2_summary = {
                         "status": "COMPLETED",
                         "reason": "",
+                        "method": "direct_query",
                         "original_metrics": original_probe_metrics,
                         "refactor_metrics": refactor_probe_metrics,
-                        "original_rowcount": extract_single_value_from_result(original_probe_result.get("stdout", "")),
-                        "refactor_rowcount": extract_single_value_from_result(refactor_probe_result.get("stdout", "")),
+                        "original_rowcount": "",
+                        "refactor_rowcount": "",
                     }
                     log_info("STEP 2 COMPLETED: comparacion read-only finalizada")
                 else:
@@ -1698,6 +1680,7 @@ def main():
             step2_summary = {
                 "status": "SKIPPED",
                 "reason": "Step 2 requiere que Step 1 se ejecute",
+                "method": "direct_query",
                 "original_metrics": None,
                 "refactor_metrics": None,
                 "original_rowcount": "",
