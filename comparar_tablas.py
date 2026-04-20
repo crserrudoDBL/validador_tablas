@@ -22,6 +22,53 @@ except ImportError:
 
 QUERY_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16}:[0-9a-fA-F]{16})")
 
+try:
+    text_type = unicode  # type: ignore[name-defined]
+except NameError:
+    text_type = str
+
+
+def decode_if_bytes(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value
+
+
+def to_text(value):
+    value = decode_if_bytes(value)
+    if value is None:
+        return ""
+    if isinstance(value, text_type):
+        return value
+    try:
+        return text_type(value)
+    except Exception:
+        return text_type(str(value))
+
+
+def write_stderr_line(message):
+    line = to_text(message) + u"\n"
+    try:
+        sys.stderr.write(line)
+    except Exception:
+        # Python 2 stderr may be bytes-only under some console encodings.
+        sys.stderr.write(line.encode("utf-8", "replace"))
+
+
+def decode_csv_row(raw_row):
+    if sys.version_info[0] >= 3:
+        return raw_row
+
+    decoded = {}
+    for key, value in raw_row.items():
+        key_text = to_text(key).lstrip(u"\ufeff")
+        if value is None:
+            value_text = u""
+        else:
+            value_text = to_text(value)
+        decoded[key_text] = value_text
+    return decoded
+
 
 def quote_ident(name):
     return name.strip()
@@ -72,10 +119,8 @@ def run_command_timed(cmd):
     ended_epoch = time.time()
     ended_at_utc = now_utc_iso()
 
-    if not isinstance(out, str):
-        out = out.decode("utf-8", "replace")
-    if not isinstance(err, str):
-        err = err.decode("utf-8", "replace")
+    out = decode_if_bytes(out)
+    err = decode_if_bytes(err)
 
     return {
         "cmd": list(cmd),
@@ -141,7 +186,14 @@ def resolve_impala_shell_command(command):
         )
 
     for candidate in candidates_from_raw(raw):
-        resolved = shutil.which(candidate)
+        if sys.version_info[0] >= 3:
+            resolved = shutil.which(candidate)
+        else:
+            try:
+                from distutils.spawn import find_executable
+                resolved = find_executable(candidate)
+            except ImportError:
+                resolved = None
         if resolved:
             return resolved
 
@@ -158,8 +210,7 @@ def open_csv_reader(path):
 
 
 def write_text_file(path, text):
-    if sys.version_info[0] < 3 and isinstance(text, str):
-        text = text.decode("utf-8", "replace")
+    text = decode_if_bytes(text)
     with io.open(path, "w", encoding="utf-8") as f:
         f.write(text)
 
@@ -179,7 +230,7 @@ def sanitize_identifier(raw):
 
 
 def normalize_query_id(value):
-    return str(value).strip().lower()
+    return to_text(value).strip().lower()
 
 
 def extract_query_id(text):
@@ -359,8 +410,7 @@ def fetch_json(url, timeout_sec):
         if hasattr(response, "close"):
             response.close()
 
-    if not isinstance(payload, str):
-        payload = payload.decode("utf-8", "replace")
+    payload = decode_if_bytes(payload)
     return json.loads(payload)
 
 
@@ -730,7 +780,8 @@ def build_rows_from_pairs_csv(args):
     rows = []
     with open_csv_reader(args.pairs) as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        for raw_row in reader:
+            row = decode_csv_row(raw_row)
             pair_name = row["pair_name"].strip()
             original_table = quote_ident(row["original_table"])
             refactor_table = quote_ident(row["refactor_table"])
@@ -1146,6 +1197,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        sys.stderr.write(str(exc) + "\n")
+        write_stderr_line(exc)
         sys.exit(1)
 
