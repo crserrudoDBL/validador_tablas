@@ -1,11 +1,26 @@
 import argparse
 import csv
 import io
+import json
 import os
+import random
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime
+
+try:
+    from urllib.parse import quote as url_quote
+    from urllib.request import Request, urlopen
+except ImportError:
+    from urllib import quote as url_quote
+    from urllib2 import Request, urlopen
+
+
+QUERY_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16}:[0-9a-fA-F]{16})")
 
 
 def quote_ident(name):
@@ -18,16 +33,59 @@ def split_list(value):
     return [v.strip() for v in value.split(";") if v.strip()]
 
 
+def read_text_file(path):
+    with io.open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def now_utc_iso():
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ensure_parent_dir(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent)
+
+
 def run_command(cmd):
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = run_command_timed(cmd)
+    return result["returncode"], result["stdout"], result["stderr"]
+
+
+def run_command_timed(cmd):
+    started_epoch = time.time()
+    started_at_utc = now_utc_iso()
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise RuntimeError(
+            "No se pudo ejecutar el comando del sistema. "
+            "Verifica que impala-shell exista y sea ejecutable.\n"
+            "Comando: {0}\n"
+            "Detalle: {1}".format(" ".join(cmd), exc)
+        )
+
     out, err = proc.communicate()
+
+    ended_epoch = time.time()
+    ended_at_utc = now_utc_iso()
 
     if not isinstance(out, str):
         out = out.decode("utf-8", "replace")
     if not isinstance(err, str):
         err = err.decode("utf-8", "replace")
 
-    return proc.returncode, out, err
+    return {
+        "cmd": list(cmd),
+        "returncode": proc.returncode,
+        "stdout": out,
+        "stderr": err,
+        "started_at_utc": started_at_utc,
+        "ended_at_utc": ended_at_utc,
+        "elapsed_sec": ended_epoch - started_epoch,
+    }
 
 
 def run_impala_file(sql_file, impala_shell, impala_opts):
@@ -36,6 +94,61 @@ def run_impala_file(sql_file, impala_shell, impala_opts):
         cmd.extend(shlex.split(impala_opts))
     cmd.extend(["-f", sql_file])
     return run_command(cmd)
+
+
+def run_impala_file_timed(sql_file, impala_shell, impala_opts, show_profiles=False):
+    cmd = [impala_shell]
+    if impala_opts:
+        cmd.extend(shlex.split(impala_opts))
+    if show_profiles:
+        cmd.append("--show_profiles")
+    cmd.extend(["-f", sql_file])
+    return run_command_timed(cmd)
+
+
+def run_impala_query_timed(query, impala_shell, impala_opts, show_profiles=False):
+    cmd = [impala_shell]
+    if impala_opts:
+        cmd.extend(shlex.split(impala_opts))
+    if show_profiles:
+        cmd.append("--show_profiles")
+    cmd.extend(["-q", query])
+    return run_command_timed(cmd)
+
+
+def resolve_impala_shell_command(command):
+    raw = (command or "").strip()
+    if not raw:
+        raise ValueError("Debes indicar --impala-shell con un comando valido.")
+
+    def candidates_from_raw(base):
+        options = [base]
+        if os.name == "nt":
+            lowered = base.lower()
+            if not (lowered.endswith(".exe") or lowered.endswith(".cmd") or lowered.endswith(".bat")):
+                options.extend([base + ".cmd", base + ".bat", base + ".exe"])
+        return options
+
+    has_path = bool(os.path.dirname(raw)) or os.path.isabs(raw)
+    if has_path:
+        for candidate in candidates_from_raw(raw):
+            if os.path.isfile(candidate):
+                return candidate
+        raise RuntimeError(
+            "No se encontro impala-shell en la ruta indicada: {0}. "
+            "Usa --impala-shell con la ruta completa del ejecutable, por ejemplo "
+            "C:/ruta/a/impala-shell.cmd".format(raw)
+        )
+
+    for candidate in candidates_from_raw(raw):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    raise RuntimeError(
+        "No se encontro el comando '{0}' en PATH. "
+        "Agrega impala-shell al PATH o indica la ruta completa con --impala-shell.".format(raw)
+    )
 
 
 def open_csv_reader(path):
@@ -53,6 +166,600 @@ def write_text_file(path, text):
 
 def normalize_col_name(col):
     return col.strip().lower()
+
+
+def sanitize_identifier(raw):
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", raw.strip().lower())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = "tmp"
+    if cleaned[0].isdigit():
+        cleaned = "t_" + cleaned
+    return cleaned
+
+
+def normalize_query_id(value):
+    return str(value).strip().lower()
+
+
+def extract_query_id(text):
+    if not text:
+        return ""
+
+    for line in text.splitlines():
+        lowered = line.lower()
+        if "query" in lowered and "id" in lowered:
+            match = QUERY_ID_PATTERN.search(line)
+            if match:
+                return normalize_query_id(match.group(1))
+
+    match = QUERY_ID_PATTERN.search(text)
+    if match:
+        return normalize_query_id(match.group(1))
+    return ""
+
+
+def infer_impala_web_url(impala_opts):
+    if not impala_opts:
+        return ""
+
+    try:
+        tokens = shlex.split(impala_opts)
+    except ValueError:
+        return ""
+
+    host_part = ""
+    for idx, token in enumerate(tokens):
+        if token == "-i" and idx + 1 < len(tokens):
+            host_part = tokens[idx + 1]
+            break
+        if token.startswith("--impalad="):
+            host_part = token.split("=", 1)[1].strip()
+            break
+
+    if not host_part:
+        return ""
+
+    host = host_part.split(":", 1)[0].strip()
+    if not host:
+        return ""
+    return "http://{0}:25000".format(host)
+
+
+def parse_float(value):
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return None
+
+
+def parse_size_to_bytes(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    text = text.replace(",", "")
+
+    # Examples: 1234, 10MB, 10 MB, 1.25 GB, 150bytes
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([kmgtp]?)(?:i?b|bytes?)?$", text, re.IGNORECASE)
+    if not match:
+        return None
+
+    number = float(match.group(1))
+    unit = match.group(2).lower()
+    factors = {
+        "": 1,
+        "k": 1024,
+        "m": 1024 ** 2,
+        "g": 1024 ** 3,
+        "t": 1024 ** 4,
+        "p": 1024 ** 5,
+    }
+    return int(number * factors.get(unit, 1))
+
+
+def parse_duration_to_ms(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip().lower()
+    if not text:
+        return None
+
+    text = text.replace(",", "")
+
+    # HH:MM:SS.sss
+    if re.match(r"^\d{1,2}:\d{2}:\d{2}(?:\.\d+)?$", text):
+        parts = text.split(":")
+        hours = float(parts[0])
+        minutes = float(parts[1])
+        seconds = float(parts[2])
+        return (hours * 3600.0 + minutes * 60.0 + seconds) * 1000.0
+
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*(ns|us|ms|s|m|h)$", text)
+    if not match:
+        return None
+
+    number = float(match.group(1))
+    unit = match.group(2)
+    if unit == "ns":
+        return number / 1e6
+    if unit == "us":
+        return number / 1e3
+    if unit == "ms":
+        return number
+    if unit == "s":
+        return number * 1000.0
+    if unit == "m":
+        return number * 60.0 * 1000.0
+    if unit == "h":
+        return number * 3600.0 * 1000.0
+    return None
+
+
+def parse_numeric_series(value):
+    if value is None:
+        return []
+
+    if isinstance(value, (int, float)):
+        return [float(value)]
+
+    if isinstance(value, list):
+        values = []
+        for item in value:
+            num = parse_float(item)
+            if num is not None:
+                values.append(num)
+        return values
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    chunks = re.split(r"[,;\s]+", text)
+    values = []
+    for chunk in chunks:
+        if not chunk:
+            continue
+        num = parse_float(chunk)
+        if num is not None:
+            values.append(num)
+    return values
+
+
+def walk_json(node):
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        if isinstance(current, dict):
+            for value in current.values():
+                stack.append(value)
+        elif isinstance(current, list):
+            for value in current:
+                stack.append(value)
+
+
+def fetch_json(url, timeout_sec):
+    request = Request(url)
+    request.add_header("Accept", "application/json")
+    response = urlopen(request, timeout=timeout_sec)
+    try:
+        payload = response.read()
+    finally:
+        if hasattr(response, "close"):
+            response.close()
+
+    if not isinstance(payload, str):
+        payload = payload.decode("utf-8", "replace")
+    return json.loads(payload)
+
+
+def pick_first(mapping, keys):
+    for key in keys:
+        if key in mapping and mapping[key] not in (None, ""):
+            return mapping[key]
+    return None
+
+
+def find_query_entry(payload, query_id):
+    target = normalize_query_id(query_id)
+    for node in walk_json(payload):
+        if not isinstance(node, dict):
+            continue
+
+        query_value = None
+        for key in ("query_id", "queryId", "queryid", "id", "queryIdStr"):
+            if key in node:
+                query_value = node[key]
+                break
+
+        if query_value is None:
+            continue
+
+        if normalize_query_id(query_value) == target:
+            return node
+    return None
+
+
+def normalize_cpu_values(values, unit_hint):
+    normalized = []
+    is_basis_points = "basis" in str(unit_hint).lower()
+    for value in values:
+        if value is None:
+            continue
+        cpu_value = float(value)
+        if is_basis_points or cpu_value > 100.0:
+            cpu_value = cpu_value / 100.0
+        normalized.append(cpu_value)
+    return normalized
+
+
+def extract_profile_json_metrics(profile_payload):
+    metrics = {
+        "cpu_user_pct_avg": None,
+        "cpu_sys_pct_avg": None,
+        "cpu_iowait_pct_avg": None,
+        "peak_memory_bytes": None,
+    }
+
+    cpu_user_samples = []
+    cpu_sys_samples = []
+    cpu_iowait_samples = []
+    memory_candidates = []
+
+    for node in walk_json(profile_payload):
+        if not isinstance(node, dict):
+            continue
+
+        for mem_key in (
+            "mem_usage",
+            "mem_est",
+            "peak_mem",
+            "peak_memory",
+            "peak_memory_bytes",
+            "memory_usage",
+            "max_mem",
+        ):
+            if mem_key in node:
+                parsed_mem = parse_size_to_bytes(node[mem_key])
+                if parsed_mem is not None:
+                    memory_candidates.append(parsed_mem)
+
+        counter_name = node.get("counter_name") or node.get("name")
+        if not counter_name:
+            continue
+
+        counter_name_lower = str(counter_name).lower()
+        unit_hint = str(node.get("unit", ""))
+
+        values = parse_numeric_series(node.get("data"))
+        if not values and node.get("value") is not None:
+            scalar = parse_float(node.get("value"))
+            if scalar is not None:
+                values = [scalar]
+
+        if not values:
+            continue
+
+        if "hostcpuuserpercentage" in counter_name_lower:
+            cpu_user_samples.extend(normalize_cpu_values(values, unit_hint))
+            continue
+        if "hostcpusyspercentage" in counter_name_lower:
+            cpu_sys_samples.extend(normalize_cpu_values(values, unit_hint))
+            continue
+        if "hostcpuiowaitpercentage" in counter_name_lower:
+            cpu_iowait_samples.extend(normalize_cpu_values(values, unit_hint))
+            continue
+
+        if "memory" in counter_name_lower:
+            unit_lower = unit_hint.lower()
+            if "byte" in unit_lower:
+                memory_candidates.extend([int(v) for v in values])
+            elif max(values) > 1024.0:
+                # Many memory counters are already in bytes even when unit metadata is absent.
+                memory_candidates.extend([int(v) for v in values])
+
+    if cpu_user_samples:
+        metrics["cpu_user_pct_avg"] = sum(cpu_user_samples) / float(len(cpu_user_samples))
+    if cpu_sys_samples:
+        metrics["cpu_sys_pct_avg"] = sum(cpu_sys_samples) / float(len(cpu_sys_samples))
+    if cpu_iowait_samples:
+        metrics["cpu_iowait_pct_avg"] = sum(cpu_iowait_samples) / float(len(cpu_iowait_samples))
+    if memory_candidates:
+        metrics["peak_memory_bytes"] = max(memory_candidates)
+
+    return metrics
+
+
+def extract_profile_text_metrics(profile_text):
+    metrics = {
+        "cpu_user_pct_avg": None,
+        "cpu_sys_pct_avg": None,
+        "cpu_iowait_pct_avg": None,
+        "peak_memory_bytes": None,
+    }
+
+    if not profile_text:
+        return metrics
+
+    def extract_cpu_samples(counter_name):
+        regex = re.compile(r"(?i){0}[^0-9\-]*([0-9]+(?:\.[0-9]+)?)".format(re.escape(counter_name)))
+        values = [parse_float(x) for x in regex.findall(profile_text)]
+        values = [x for x in values if x is not None]
+        return normalize_cpu_values(values, "basis_points")
+
+    user_samples = extract_cpu_samples("HostCpuUserPercentage")
+    sys_samples = extract_cpu_samples("HostCpuSysPercentage")
+    iowait_samples = extract_cpu_samples("HostCpuIoWaitPercentage")
+
+    if user_samples:
+        metrics["cpu_user_pct_avg"] = sum(user_samples) / float(len(user_samples))
+    if sys_samples:
+        metrics["cpu_sys_pct_avg"] = sum(sys_samples) / float(len(sys_samples))
+    if iowait_samples:
+        metrics["cpu_iowait_pct_avg"] = sum(iowait_samples) / float(len(iowait_samples))
+
+    memory_candidates = []
+    for regex in (
+        re.compile(r"(?i)(?:peak[^\n]*memory|peakmem[^\n]*)[^0-9]*([0-9]+(?:\.[0-9]+)?\s*[kmgtp]?b)") ,
+        re.compile(r"(?i)(?:peak[^\n]*memory|peakmem[^\n]*)[^0-9]*([0-9][0-9,]*)"),
+    ):
+        for raw_value in regex.findall(profile_text):
+            parsed_mem = parse_size_to_bytes(raw_value)
+            if parsed_mem is not None:
+                memory_candidates.append(parsed_mem)
+
+    if memory_candidates:
+        metrics["peak_memory_bytes"] = max(memory_candidates)
+
+    return metrics
+
+
+def collect_api_metrics(query_id, impala_web_url, timeout_sec):
+    metrics = {
+        "api_duration_ms": None,
+        "peak_memory_bytes": None,
+        "cpu_user_pct_avg": None,
+        "cpu_sys_pct_avg": None,
+        "cpu_iowait_pct_avg": None,
+        "sources": [],
+        "warnings": [],
+    }
+
+    if not impala_web_url or not query_id:
+        return metrics
+
+    base_url = impala_web_url.rstrip("/")
+
+    try:
+        payload = fetch_json(base_url + "/queries?json", timeout_sec)
+        entry = find_query_entry(payload, query_id)
+        if entry:
+            duration_raw = pick_first(entry, ["duration", "duration_ms", "query_duration", "exec_time", "time_ms"])
+            duration_ms = parse_duration_to_ms(duration_raw)
+            if duration_ms is not None:
+                metrics["api_duration_ms"] = duration_ms
+
+            memory_raw = pick_first(entry, ["mem_usage", "peak_mem", "peak_memory", "memory_usage", "mem_est"])
+            memory_bytes = parse_size_to_bytes(memory_raw)
+            if memory_bytes is not None:
+                metrics["peak_memory_bytes"] = memory_bytes
+
+            metrics["sources"].append("queries_json")
+        else:
+            metrics["warnings"].append("query_id_no_encontrado_en_queries_json")
+    except Exception as exc:
+        metrics["warnings"].append("error_queries_json:{0}".format(exc))
+
+    try:
+        profile_url = base_url + "/query_profile_json?query_id=" + url_quote(query_id)
+        profile_payload = fetch_json(profile_url, timeout_sec)
+        profile_metrics = extract_profile_json_metrics(profile_payload)
+
+        for key in ("peak_memory_bytes", "cpu_user_pct_avg", "cpu_sys_pct_avg", "cpu_iowait_pct_avg"):
+            if profile_metrics.get(key) is not None:
+                metrics[key] = profile_metrics[key]
+
+        metrics["sources"].append("query_profile_json")
+    except Exception as exc:
+        metrics["warnings"].append("error_query_profile_json:{0}".format(exc))
+
+    return metrics
+
+
+def load_sql_query_for_ctas(path):
+    sql_text = read_text_file(path).strip()
+    if not sql_text:
+        raise ValueError("El archivo SQL esta vacio: {0}".format(path))
+
+    while sql_text.endswith(";"):
+        sql_text = sql_text[:-1].strip()
+
+    if not sql_text:
+        raise ValueError("El archivo SQL no contiene una consulta valida: {0}".format(path))
+
+    if ";" in sql_text:
+        raise ValueError(
+            "El archivo {0} debe contener una unica query SELECT (CTEs permitidas), sin multiples sentencias.".format(path)
+        )
+
+    if not re.match(r"^(with|select)\b", sql_text, flags=re.IGNORECASE):
+        raise ValueError(
+            "El archivo {0} debe iniciar con SELECT o WITH para crear la tabla temporal.".format(path)
+        )
+
+    return sql_text
+
+
+def make_temp_table_name(temp_db, temp_prefix, pair_name, role):
+    db = sanitize_identifier(temp_db)
+    prefix = sanitize_identifier(temp_prefix)
+    pair = sanitize_identifier(pair_name)
+    role_part = sanitize_identifier(role)
+
+    base_name = "{0}_{1}_{2}".format(prefix, pair, role_part)
+    base_name = base_name[:80]
+    suffix = "{0}_{1}_{2}".format(int(time.time()), os.getpid(), random.randint(1000, 9999))
+    return "{0}.{1}_{2}".format(db, base_name, suffix)
+
+
+def format_impala_error(action_label, result):
+    stderr = (result.get("stderr") or "").strip()
+    stdout = (result.get("stdout") or "").strip()
+    cmd = " ".join(result.get("cmd") or [])
+
+    lines = [
+        "ERROR en {0} (exit code {1}).".format(action_label, result.get("returncode")),
+        "Comando: {0}".format(cmd),
+    ]
+    if stderr:
+        lines.append("STDERR: {0}".format(stderr))
+    if stdout:
+        lines.append("STDOUT: {0}".format(stdout[:2000]))
+    return "\n".join(lines)
+
+
+def build_step_metrics(step_name, result, impala_web_url, web_timeout_sec, allow_api=True):
+    combined_output = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
+    query_id = extract_query_id(combined_output)
+
+    metrics = {
+        "step": step_name,
+        "status": "OK" if result.get("returncode") == 0 else "ERROR",
+        "return_code": result.get("returncode"),
+        "query_id": query_id,
+        "started_at_utc": result.get("started_at_utc"),
+        "ended_at_utc": result.get("ended_at_utc"),
+        "elapsed_wall_sec": result.get("elapsed_sec"),
+        "api_duration_ms": None,
+        "peak_memory_bytes": None,
+        "cpu_user_pct_avg": None,
+        "cpu_sys_pct_avg": None,
+        "cpu_iowait_pct_avg": None,
+        "metric_source": "",
+        "metric_warnings": [],
+    }
+
+    source_tags = []
+
+    if allow_api and impala_web_url and query_id:
+        api_metrics = collect_api_metrics(query_id, impala_web_url, web_timeout_sec)
+        for key in ("api_duration_ms", "peak_memory_bytes", "cpu_user_pct_avg", "cpu_sys_pct_avg", "cpu_iowait_pct_avg"):
+            if api_metrics.get(key) is not None:
+                metrics[key] = api_metrics[key]
+
+        if api_metrics.get("sources"):
+            source_tags.extend(api_metrics.get("sources"))
+        if api_metrics.get("warnings"):
+            metrics["metric_warnings"].extend(api_metrics.get("warnings"))
+
+    needs_profile_fallback = (
+        metrics["peak_memory_bytes"] is None
+        or metrics["cpu_user_pct_avg"] is None
+        or metrics["cpu_sys_pct_avg"] is None
+        or metrics["cpu_iowait_pct_avg"] is None
+    )
+
+    if needs_profile_fallback and combined_output.strip():
+        profile_metrics = extract_profile_text_metrics(combined_output)
+        for key in ("peak_memory_bytes", "cpu_user_pct_avg", "cpu_sys_pct_avg", "cpu_iowait_pct_avg"):
+            if metrics.get(key) is None and profile_metrics.get(key) is not None:
+                metrics[key] = profile_metrics[key]
+
+        if any(profile_metrics.values()):
+            source_tags.append("profile_text")
+
+    if not source_tags:
+        source_tags.append("wall_clock_only")
+
+    metrics["metric_source"] = ",".join(source_tags)
+    return metrics
+
+
+def format_mb(memory_bytes):
+    if memory_bytes is None:
+        return "n/a"
+    return "{0:.2f}".format(float(memory_bytes) / (1024.0 * 1024.0))
+
+
+def format_pct(value):
+    if value is None:
+        return "n/a"
+    return "{0:.2f}".format(value)
+
+
+def print_metrics_summary(metrics_rows):
+    if not metrics_rows:
+        return
+
+    print("\n=== Metricas por query ===")
+    for row in metrics_rows:
+        print(
+            "[{0}] status={1} elapsed={2:.3f}s query_id={3}".format(
+                row["step"],
+                row["status"],
+                float(row["elapsed_wall_sec"] or 0.0),
+                row["query_id"] or "n/a",
+            )
+        )
+        print(
+            "  source={0} duration_ms={1} peak_mem_mb={2} cpu_user={3}% cpu_sys={4}% cpu_iowait={5}%".format(
+                row["metric_source"],
+                "{0:.2f}".format(row["api_duration_ms"]) if row["api_duration_ms"] is not None else "n/a",
+                format_mb(row["peak_memory_bytes"]),
+                format_pct(row["cpu_user_pct_avg"]),
+                format_pct(row["cpu_sys_pct_avg"]),
+                format_pct(row["cpu_iowait_pct_avg"]),
+            )
+        )
+        if row.get("metric_warnings"):
+            print("  warnings={0}".format(" | ".join(row["metric_warnings"])))
+
+
+def build_rows_from_pairs_csv(args):
+    rows = []
+    with open_csv_reader(args.pairs) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            pair_name = row["pair_name"].strip()
+            original_table = quote_ident(row["original_table"])
+            refactor_table = quote_ident(row["refactor_table"])
+            key_columns = split_list(row.get("key_columns", ""))
+
+            if not pair_name or not original_table or not refactor_table:
+                raise ValueError("Cada fila debe tener pair_name, original_table y refactor_table.")
+
+            cols_a = run_describe(original_table, args.impala_shell, args.impala_opts)
+            cols_b = run_describe(refactor_table, args.impala_shell, args.impala_opts)
+            common_cols = shared_columns(cols_a, cols_b)
+            if not common_cols:
+                raise ValueError(
+                    "El par {0} no tiene columnas en comun entre {1} y {2}.".format(
+                        pair_name, original_table, refactor_table
+                    )
+                )
+
+            if args.auto_columns and not key_columns:
+                key_columns = choose_auto_key_columns(common_cols)
+
+            if not key_columns:
+                raise ValueError(
+                    "El par {0} no tiene key_columns. Cargalas en el CSV o usa --auto-columns.".format(pair_name)
+                )
+
+            rows.append((pair_name, original_table, refactor_table, key_columns, common_cols))
+
+    return rows
 
 
 def run_describe(table_name, impala_shell, impala_opts):
@@ -187,9 +894,16 @@ def metric_block(pair_name, original_table, refactor_table, key_columns, compare
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Genera SQL estandar para comparar tablas original vs refactor.")
-    parser.add_argument("--pairs", default="pruebas/table_pairs.csv", help="CSV con pares a comparar")
-    parser.add_argument("--output", default="pruebas/validacion_pares_generada.sql", help="Archivo SQL de salida")
+    parser = argparse.ArgumentParser(description="Valida equivalencia entre tablas (modo CSV) o queries (modo SQL).")
+    parser.add_argument("--mode", choices=["auto", "pairs", "sql"], default="auto", help="Modo de ejecucion.")
+    parser.add_argument("--pairs", default="table_pairs.csv", help="CSV con pares a comparar (modo pairs)")
+    parser.add_argument("--output", default="validacion_pares_generada.sql", help="Archivo SQL de salida")
+    parser.add_argument("--original-sql", default="", help="Archivo SQL de query original (modo sql)")
+    parser.add_argument("--refactor-sql", default="", help="Archivo SQL de query refactor (modo sql)")
+    parser.add_argument("--pair-name", default="sql_file_pair", help="Nombre logico del par en modo sql")
+    parser.add_argument("--key-columns", default="", help="Columnas clave separadas por ';' (modo sql)")
+    parser.add_argument("--temp-db", default="default", help="Base de datos para tablas temporales (modo sql)")
+    parser.add_argument("--temp-prefix", default="cmp_tmp", help="Prefijo para tablas temporales (modo sql)")
     parser.add_argument(
         "--auto-columns",
         dest="auto_columns",
@@ -215,30 +929,113 @@ def main():
     parser.add_argument(
         "--run",
         action="store_true",
-        help="Ejecuta automaticamente el SQL generado usando impala-shell.",
+        help="Ejecuta automaticamente el SQL generado usando impala-shell (en modo sql se ejecuta siempre).",
     )
     parser.add_argument(
         "--result-output",
         default="",
         help="Archivo para guardar stdout de la ejecucion (si --run).",
     )
+    parser.add_argument(
+        "--impala-web-url",
+        default="",
+        help="URL base del web UI de Impala para metricas (ej: http://host:25000).",
+    )
+    parser.add_argument(
+        "--impala-web-timeout",
+        type=int,
+        default=10,
+        help="Timeout (segundos) para requests al API web de Impala.",
+    )
+    parser.add_argument(
+        "--metrics-json",
+        default="",
+        help="Archivo JSON para guardar metricas por query.",
+    )
     parser.set_defaults(auto_columns=True)
     args = parser.parse_args()
 
-    pairs_path = args.pairs
+    args.impala_shell = resolve_impala_shell_command(args.impala_shell)
+
+    has_original_sql = bool(args.original_sql.strip())
+    has_refactor_sql = bool(args.refactor_sql.strip())
+
+    if has_original_sql != has_refactor_sql:
+        raise ValueError("Debes indicar ambos archivos: --original-sql y --refactor-sql.")
+
+    if args.mode == "sql":
+        if not (has_original_sql and has_refactor_sql):
+            raise ValueError("Modo sql requiere --original-sql y --refactor-sql.")
+        use_sql_mode = True
+    elif args.mode == "pairs":
+        if has_original_sql or has_refactor_sql:
+            raise ValueError("Modo pairs no admite --original-sql/--refactor-sql.")
+        use_sql_mode = False
+    else:
+        use_sql_mode = has_original_sql and has_refactor_sql
+
     output_path = args.output
+    temp_tables = []
+    metrics_rows = []
 
-    rows = []
-    with open_csv_reader(pairs_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            pair_name = row["pair_name"].strip()
-            original_table = quote_ident(row["original_table"])
-            refactor_table = quote_ident(row["refactor_table"])
-            key_columns = split_list(row.get("key_columns", ""))
+    impala_web_url = args.impala_web_url.strip() or infer_impala_web_url(args.impala_opts)
+    if impala_web_url:
+        print("INFO: metricas API habilitadas via {0}".format(impala_web_url))
+    else:
+        print("INFO: metricas API no configuradas; se usara wall-clock y fallback de PROFILE cuando exista.")
 
-            if not pair_name or not original_table or not refactor_table:
-                raise ValueError("Cada fila debe tener pair_name, original_table y refactor_table.")
+    execute_generated_sql = args.run or use_sql_mode
+
+    try:
+        if use_sql_mode:
+            key_columns = split_list(args.key_columns)
+            pair_name = args.pair_name.strip() or "sql_file_pair"
+
+            original_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "original")
+            refactor_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "refactor")
+
+            original_query = load_sql_query_for_ctas(args.original_sql)
+            refactor_query = load_sql_query_for_ctas(args.refactor_sql)
+
+            create_original_sql = "CREATE TABLE {0} AS {1}".format(original_table, original_query)
+            create_original_result = run_impala_query_timed(
+                create_original_sql,
+                args.impala_shell,
+                args.impala_opts,
+                show_profiles=True,
+            )
+            metrics_rows.append(
+                build_step_metrics(
+                    "create_original_temp_table",
+                    create_original_result,
+                    impala_web_url,
+                    args.impala_web_timeout,
+                    allow_api=True,
+                )
+            )
+            if create_original_result["returncode"] != 0:
+                raise RuntimeError(format_impala_error("CREATE TABLE original", create_original_result))
+            temp_tables.append(original_table)
+
+            create_refactor_sql = "CREATE TABLE {0} AS {1}".format(refactor_table, refactor_query)
+            create_refactor_result = run_impala_query_timed(
+                create_refactor_sql,
+                args.impala_shell,
+                args.impala_opts,
+                show_profiles=True,
+            )
+            metrics_rows.append(
+                build_step_metrics(
+                    "create_refactor_temp_table",
+                    create_refactor_result,
+                    impala_web_url,
+                    args.impala_web_timeout,
+                    allow_api=True,
+                )
+            )
+            if create_refactor_result["returncode"] != 0:
+                raise RuntimeError(format_impala_error("CREATE TABLE refactor", create_refactor_result))
+            temp_tables.append(refactor_table)
 
             cols_a = run_describe(original_table, args.impala_shell, args.impala_opts)
             cols_b = run_describe(refactor_table, args.impala_shell, args.impala_opts)
@@ -255,48 +1052,100 @@ def main():
 
             if not key_columns:
                 raise ValueError(
-                    "El par {0} no tiene key_columns. Cargalas en el CSV o usa --auto-columns.".format(pair_name)
+                    "El par {0} no tiene key_columns. Usa --key-columns o --auto-columns.".format(pair_name)
                 )
 
-            rows.append((pair_name, original_table, refactor_table, key_columns, common_cols))
+            rows = [(pair_name, original_table, refactor_table, key_columns, common_cols)]
+        else:
+            rows = build_rows_from_pairs_csv(args)
 
-    sql_parts = [
-        "-- SQL generado automaticamente para validacion funcional",
-        "-- Metricas: count, anti-join por clave, hash y comparacion estricta por fila completa con multiplicidad.",
-        "-- Nota: para hash y validacion estricta se usan las columnas en comun detectadas por DESCRIBE.",
-        ""
-    ]
+        sql_parts = [
+            "-- SQL generado automaticamente para validacion funcional",
+            "-- Metricas: count, anti-join por clave, hash y comparacion estricta por fila completa con multiplicidad.",
+            "-- Nota: para hash y validacion estricta se usan las columnas en comun detectadas por DESCRIBE.",
+            "",
+        ]
 
-    for r in rows:
-        sql_parts.append(metric_block(r[0], r[1], r[2], r[3], r[4]))
+        for row_data in rows:
+            sql_parts.append(metric_block(row_data[0], row_data[1], row_data[2], row_data[3], row_data[4]))
 
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+        ensure_parent_dir(output_path)
+        write_text_file(output_path, "\n".join(sql_parts))
+        print("OK: SQL generado en {0}".format(output_path))
 
-    write_text_file(output_path, "\n".join(sql_parts))
-    print("OK: SQL generado en {0}".format(output_path))
+        if execute_generated_sql:
+            compare_result = run_impala_file_timed(
+                output_path,
+                args.impala_shell,
+                args.impala_opts,
+                show_profiles=True,
+            )
+            metrics_rows.append(
+                build_step_metrics(
+                    "execute_comparison_sql",
+                    compare_result,
+                    impala_web_url,
+                    args.impala_web_timeout,
+                    allow_api=True,
+                )
+            )
 
-    if args.run:
-        returncode, stdout, stderr = run_impala_file(output_path, args.impala_shell, args.impala_opts)
+            if args.result_output:
+                ensure_parent_dir(args.result_output)
+                write_text_file(args.result_output, compare_result["stdout"])
 
-        if args.result_output:
-            result_dir = os.path.dirname(os.path.abspath(args.result_output))
-            if result_dir and not os.path.exists(result_dir):
-                os.makedirs(result_dir)
-            write_text_file(args.result_output, stdout)
+            if compare_result["returncode"] != 0:
+                raise RuntimeError(format_impala_error("ejecucion SQL de comparacion", compare_result))
 
-        if returncode != 0:
-            msg = "ERROR ejecutando Impala (exit code {0}).".format(returncode)
-            if stderr:
-                msg += "\n" + stderr.strip()
-            raise RuntimeError(msg)
+            print("OK: SQL ejecutado en Impala.")
+            if args.result_output:
+                print("OK: Resultado guardado en {0}".format(args.result_output))
+        else:
+            print("INFO: SQL no ejecutado (usa --run).")
+    finally:
+        if use_sql_mode and temp_tables:
+            cleanup_errors = []
+            for temp_table in temp_tables:
+                drop_sql = "DROP TABLE IF EXISTS {0}".format(temp_table)
+                drop_result = run_impala_query_timed(
+                    drop_sql,
+                    args.impala_shell,
+                    args.impala_opts,
+                    show_profiles=False,
+                )
+                metrics_rows.append(
+                    build_step_metrics(
+                        "drop_temp_table:{0}".format(temp_table),
+                        drop_result,
+                        impala_web_url,
+                        args.impala_web_timeout,
+                        allow_api=True,
+                    )
+                )
+                if drop_result["returncode"] != 0:
+                    cleanup_errors.append(format_impala_error("DROP TABLE {0}".format(temp_table), drop_result))
 
-        print("OK: SQL ejecutado en Impala.")
-        if args.result_output:
-            print("OK: Resultado guardado en {0}".format(args.result_output))
+            if cleanup_errors:
+                print("WARN: hubo errores en cleanup de temporales:")
+                for err in cleanup_errors:
+                    print(err)
+            else:
+                print("OK: tablas temporales eliminadas.")
+
+        try:
+            print_metrics_summary(metrics_rows)
+            if args.metrics_json:
+                ensure_parent_dir(args.metrics_json)
+                write_text_file(args.metrics_json, json.dumps(metrics_rows, indent=2, sort_keys=True))
+                print("OK: metricas guardadas en {0}".format(args.metrics_json))
+        except Exception as exc:
+            print("WARN: no se pudieron emitir metricas: {0}".format(exc))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        sys.stderr.write(str(exc) + "\n")
+        sys.exit(1)
 
