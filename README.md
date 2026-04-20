@@ -9,7 +9,7 @@ Tiene un unico modo de validacion. Para cada par de tablas ejecuta:
 1. `count(*)`
 2. `anti-join` por clave (`A-B` y `B-A`)
 3. `hash checksum` de filas (auditoria rapida)
-4. Comparacion 100% estricta: misma fila completa y misma cantidad de ocurrencias por fila en A y B
+4. full-row multiset comparison
 
 ## Ejecucion
 
