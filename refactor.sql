@@ -1,4 +1,3 @@
-CREATE TABLE default.ca_ms07_refactor_v3_temp AS
 WITH calendario AS (
     -- NUESTRO TRUCO: Doble tipado para encender Kudu
     SELECT DISTINCT CAST(fecha_dia AS DATE) AS fecha_saldo_date,
