@@ -35,7 +35,8 @@ Tambien incluye muestras de diferencias lado a lado (hasta 50 por lado) cuando h
 	- Re-ejecuta ambas queries en modo read-only para comparar tiempo y recursos.
 	- Metodo usado: ejecucion directa de cada query (sin `CREATE`/`INSERT`/`DROP` en Step 2) para medir tiempo y recursos sobre la query real.
 	- Ejecuta cada query varias veces (`--step2-runs`, por defecto `5`) con orden alternado por ronda para reducir sesgo por estado del cluster.
-	- Compara por mediana de tiempo/memoria/CPU y muestra series por corrida.
+	- Al finalizar todas las corridas, espera un intervalo corto y luego busca las metricas por `query_id` en Elasticsearch.
+	- Compara por mediana de `duration_ms`, memoria total y CPU total, y muestra series por corrida.
 
 ## Modo 1: comparar tablas existentes (`pairs`)
 
@@ -96,12 +97,31 @@ Por cada paso de query (crear temporal original, crear temporal refactor, compar
 
 - tiempo wall-clock (`elapsed_wall_sec`)
 - `query_id` cuando se detecta en salida de `impala-shell`
-- memoria pico y CPU (si se puede obtener)
 
-Fuentes de metricas:
+En Step 2 (solo modo `sql`), las metricas se enriquecen al final con Elasticsearch:
 
-1. API web de Impala (preferida): `--impala-web-url` o inferida desde `--impala-opts`.
-2. Fallback: parseo best-effort del texto de profile en salida de `impala-shell`.
+- tiempo de query desde `duration_ms`
+- CPU total como suma de `cpu_time_per_host.*`
+- memoria total como suma de `mem_per_host.*`
+
+Reglas de tolerancia a faltantes:
+
+- si falta el documento en Elasticsearch para un `query_id`, se mantiene `duration_ms` con backup de wall-clock
+- en CPU/memoria, si no hay valores por host, se deja `null`
+- si hay al menos un host informado, se suma lo disponible
+
+### Configuracion Elasticsearch (.env)
+
+Archivo `.env` esperado:
+
+```dotenv
+ELASTIC_HOST=172.30.215.74
+ELASTIC_PORT=9200
+ELASTIC_USERNAME=elastic
+ELASTIC_PASSWORD=***
+```
+
+El indice por defecto es `impala-metricas-queries`.
 
 ## Reporte humano TXT
 
@@ -132,8 +152,10 @@ python comparar_tablas.py ... --metrics-json metricas.json
 - `--impala-opts`: opciones de conexion (`-i`, kerberos, etc.).
 - `--run`: ejecuta el SQL generado (en modo `sql` se ejecuta siempre).
 - `--result-output`: guarda stdout de ejecucion.
-- `--impala-web-url`: URL base para metricas API (ej: `http://host:25000`).
-- `--impala-web-timeout`: timeout de llamadas HTTP.
+- `--elastic-env-file`: ruta al `.env` con credenciales (`.env` por defecto).
+- `--elastic-index`: indice base de metricas (`impala-metricas-queries` por defecto).
+- `--elastic-wait-sec`: espera antes del lookup final de Step 2 (por defecto `60`).
+- `--elastic-timeout`: timeout HTTP para requests a Elasticsearch.
 - `--metrics-json`: salida JSON de metricas.
 - `--human-report`: salida TXT legible (por defecto `comparison_report.txt`).
 - `--step2-runs`: cantidad de corridas por query en Step 2 (por defecto `5`, en orden alternado).

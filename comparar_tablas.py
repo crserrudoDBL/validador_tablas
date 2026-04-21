@@ -1,4 +1,5 @@
 import argparse
+import base64
 import csv
 import io
 import json
@@ -24,6 +25,10 @@ QUERY_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16}:[0-9a-fA-F]{16})")
 DEFAULT_SAMPLE_SIZE = 50
 DEFAULT_STEP2_RUNS = 5
 DEFAULT_HUMAN_REPORT_PATH = "comparison_report.txt"
+DEFAULT_ELASTIC_INDEX = "impala-metricas-queries"
+DEFAULT_ELASTIC_ENV_FILE = ".env"
+DEFAULT_ELASTIC_WAIT_SEC = 60
+DEFAULT_ELASTIC_TIMEOUT_SEC = 15
 SAMPLE_VALUE_SEPARATOR = " ||| "
 
 try:
@@ -470,6 +475,339 @@ def fetch_json(url, timeout_sec):
     return json.loads(payload)
 
 
+def load_env_file(path):
+    env_map = {}
+    if not path:
+        return env_map
+    if not os.path.exists(path):
+        return env_map
+
+    with io.open(path, "r", encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = to_text(raw_line).strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+
+            env_map[key] = value
+    return env_map
+
+
+def get_env_setting(env_map, key, default=""):
+    os_value = os.environ.get(key)
+    if os_value not in (None, ""):
+        return to_text(os_value).strip()
+    env_value = env_map.get(key)
+    if env_value not in (None, ""):
+        return to_text(env_value).strip()
+    return default
+
+
+def resolve_elastic_config(env_file, index_name):
+    env_map = load_env_file(env_file)
+
+    host = get_env_setting(env_map, "ELASTIC_HOST")
+    port = get_env_setting(env_map, "ELASTIC_PORT")
+    username = get_env_setting(env_map, "ELASTIC_USERNAME")
+    password = get_env_setting(env_map, "ELASTIC_PASSWORD")
+    scheme = get_env_setting(env_map, "ELASTIC_SCHEME", "http") or "http"
+    index = to_text(index_name or "").strip() or DEFAULT_ELASTIC_INDEX
+
+    missing = []
+    if not host:
+        missing.append("ELASTIC_HOST")
+    if not port:
+        missing.append("ELASTIC_PORT")
+    if not username:
+        missing.append("ELASTIC_USERNAME")
+    if not password:
+        missing.append("ELASTIC_PASSWORD")
+
+    if missing:
+        raise ValueError(
+            "Faltan variables de Elasticsearch: {0}. Revisa {1}.".format(
+                ", ".join(missing),
+                env_file or DEFAULT_ELASTIC_ENV_FILE,
+            )
+        )
+
+    return {
+        "scheme": scheme,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "index": index,
+    }
+
+
+def build_basic_auth_header(username, password):
+    token = "{0}:{1}".format(to_text(username), to_text(password))
+    if sys.version_info[0] >= 3:
+        encoded = base64.b64encode(token.encode("utf-8")).decode("ascii")
+    else:
+        encoded = base64.b64encode(token)
+    return "Basic " + encoded
+
+
+def fetch_json_post(url, payload, timeout_sec, auth_header):
+    started = time.time()
+    body = json.dumps(payload)
+    if sys.version_info[0] >= 3:
+        body = body.encode("utf-8")
+
+    request = Request(url, data=body)
+    request.add_header("Accept", "application/json")
+    request.add_header("Content-Type", "application/json")
+    if auth_header:
+        request.add_header("Authorization", auth_header)
+
+    response = urlopen(request, timeout=timeout_sec)
+    try:
+        response_payload = response.read()
+    finally:
+        if hasattr(response, "close"):
+            response.close()
+
+    response_payload = decode_if_bytes(response_payload)
+    log_info("END elastic_request: url={0} elapsed={1:.3f}s".format(url, time.time() - started))
+    return json.loads(response_payload)
+
+
+def first_scalar(value):
+    if isinstance(value, list):
+        for item in value:
+            resolved = first_scalar(item)
+            if resolved not in (None, ""):
+                return resolved
+        return None
+    return value
+
+
+def extract_query_id_from_elastic_doc(doc):
+    for key in ("query_id", "queryId", "queryid", "id", "_id"):
+        if key in doc:
+            qid = first_scalar(doc.get(key))
+            if qid:
+                return normalize_query_id(qid)
+    return ""
+
+
+def sum_prefixed_numeric_fields(doc, field_prefix):
+    total = 0.0
+    has_any_value = False
+
+    for key, raw_value in (doc or {}).items():
+        if not to_text(key).startswith(field_prefix):
+            continue
+
+        series = parse_numeric_series(raw_value)
+        if not series:
+            continue
+
+        has_any_value = True
+        total += sum(series)
+
+    if not has_any_value:
+        return None
+    return total
+
+
+def extract_elastic_query_metrics(doc):
+    metrics = {
+        "duration_ms": None,
+        "cpu_total": None,
+        "memory_total_bytes": None,
+        "warnings": [],
+    }
+
+    duration_raw = first_scalar(pick_first(doc, ["duration_ms", "duration"]))
+    duration_ms = parse_duration_to_ms(duration_raw)
+    if duration_ms is not None:
+        metrics["duration_ms"] = duration_ms
+    else:
+        metrics["warnings"].append("elastic_duration_missing")
+
+    cpu_total = sum_prefixed_numeric_fields(doc, "cpu_time_per_host.")
+    if cpu_total is None:
+        metrics["warnings"].append("elastic_cpu_missing")
+    else:
+        metrics["cpu_total"] = cpu_total
+
+    memory_total = sum_prefixed_numeric_fields(doc, "mem_per_host.")
+    if memory_total is None:
+        metrics["warnings"].append("elastic_mem_missing")
+    else:
+        metrics["memory_total_bytes"] = memory_total
+
+    return metrics
+
+
+def build_elastic_search_payload(query_ids):
+    normalized_ids = [normalize_query_id(qid) for qid in query_ids if normalize_query_id(qid)]
+    return {
+        "size": max(10, len(normalized_ids) * 3),
+        "query": {
+            "bool": {
+                "should": [
+                    {"terms": {"query_id.keyword": normalized_ids}},
+                    {"terms": {"query_id": normalized_ids}},
+                    {"ids": {"values": normalized_ids}},
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+    }
+
+
+def fetch_elastic_docs_by_query_ids(query_ids, elastic_config, timeout_sec):
+    base_url = "{0}://{1}:{2}".format(
+        elastic_config["scheme"],
+        elastic_config["host"],
+        elastic_config["port"],
+    )
+    index_name = elastic_config["index"]
+    payload = build_elastic_search_payload(query_ids)
+    auth_header = build_basic_auth_header(elastic_config["username"], elastic_config["password"])
+
+    endpoints = [
+        "{0}/{1}/_search".format(base_url, url_quote(index_name)),
+        "{0}/{1}-*/_search".format(base_url, url_quote(index_name)),
+    ]
+
+    last_error = None
+    for endpoint in endpoints:
+        try:
+            log_info("START elastic_request: url={0} timeout={1}s".format(endpoint, timeout_sec))
+            payload_json = fetch_json_post(endpoint, payload, timeout_sec, auth_header)
+            hits = (((payload_json or {}).get("hits") or {}).get("hits") or [])
+            docs_by_query_id = {}
+            for hit in hits:
+                source = hit.get("_source") if isinstance(hit, dict) else None
+                if not isinstance(source, dict):
+                    continue
+                doc = dict(source)
+                if "_id" not in doc and isinstance(hit, dict) and hit.get("_id"):
+                    doc["_id"] = hit.get("_id")
+
+                query_id = extract_query_id_from_elastic_doc(doc)
+                if query_id and query_id not in docs_by_query_id:
+                    docs_by_query_id[query_id] = doc
+            return docs_by_query_id
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        "No se pudo consultar Elasticsearch en los endpoints esperados del indice {0}: {1}".format(
+            index_name,
+            last_error,
+        )
+    )
+
+
+def wall_clock_ms_from_metric(metric_row):
+    elapsed = to_float_metric((metric_row or {}).get("elapsed_wall_sec"))
+    if elapsed is None:
+        return None
+    return elapsed * 1000.0
+
+
+def append_metric_warning(metric_row, warning):
+    warning_text = to_text(warning).strip()
+    if not warning_text:
+        return
+    warning_list = metric_row.setdefault("metric_warnings", [])
+    if warning_text not in warning_list:
+        warning_list.append(warning_text)
+
+
+def enrich_step2_metrics_from_elastic(step2_run_metrics, elastic_config, wait_sec, timeout_sec):
+    if not step2_run_metrics:
+        return
+
+    lookup_ids = []
+    seen_ids = set()
+    for run_metric in step2_run_metrics:
+        query_id = normalize_query_id(run_metric.get("query_id"))
+        if query_id and query_id not in seen_ids:
+            lookup_ids.append(query_id)
+            seen_ids.add(query_id)
+
+    if not lookup_ids:
+        for run_metric in step2_run_metrics:
+            run_metric["duration_ms"] = wall_clock_ms_from_metric(run_metric)
+            run_metric["api_duration_ms"] = run_metric["duration_ms"]
+            run_metric["cpu_total"] = None
+            run_metric["memory_total_bytes"] = None
+            run_metric["peak_memory_bytes"] = None
+            run_metric["metric_source"] = "wall_clock_backup"
+            append_metric_warning(run_metric, "query_id_missing_for_elastic_lookup")
+        return
+
+    wait_seconds = max(0, int(wait_sec or 0))
+    if wait_seconds > 0:
+        log_info(
+            "Esperando {0}s antes de consultar Elasticsearch para {1} query_ids de Step 2".format(
+                wait_seconds,
+                len(lookup_ids),
+            )
+        )
+        time.sleep(wait_seconds)
+
+    docs_by_query_id = fetch_elastic_docs_by_query_ids(lookup_ids, elastic_config, timeout_sec)
+
+    for run_metric in step2_run_metrics:
+        query_id = normalize_query_id(run_metric.get("query_id"))
+        fallback_duration_ms = wall_clock_ms_from_metric(run_metric)
+
+        run_metric["duration_ms"] = fallback_duration_ms
+        run_metric["api_duration_ms"] = fallback_duration_ms
+        run_metric["cpu_total"] = None
+        run_metric["memory_total_bytes"] = None
+        run_metric["peak_memory_bytes"] = None
+
+        if not query_id:
+            run_metric["metric_source"] = "wall_clock_backup"
+            append_metric_warning(run_metric, "query_id_missing_for_elastic_lookup")
+            continue
+
+        doc = docs_by_query_id.get(query_id)
+        if doc is None:
+            run_metric["metric_source"] = "wall_clock_backup"
+            append_metric_warning(run_metric, "elastic_doc_missing:{0}".format(query_id))
+            continue
+
+        doc_metrics = extract_elastic_query_metrics(doc)
+        source_tags = ["elastic_index"]
+
+        if doc_metrics["duration_ms"] is not None:
+            run_metric["duration_ms"] = doc_metrics["duration_ms"]
+            run_metric["api_duration_ms"] = doc_metrics["duration_ms"]
+        else:
+            source_tags.append("wall_clock_backup")
+
+        run_metric["cpu_total"] = doc_metrics["cpu_total"]
+        run_metric["memory_total_bytes"] = doc_metrics["memory_total_bytes"]
+        run_metric["peak_memory_bytes"] = doc_metrics["memory_total_bytes"]
+
+        for warning in doc_metrics.get("warnings") or []:
+            append_metric_warning(run_metric, "{0}:{1}".format(warning, query_id))
+
+        run_metric["metric_source"] = ",".join(source_tags)
+
+
 def pick_first(mapping, keys):
     for key in keys:
         if key in mapping and mapping[key] not in (None, ""):
@@ -735,9 +1073,15 @@ def format_impala_error(action_label, result):
     return "\n".join(lines)
 
 
-def build_step_metrics(step_name, result, impala_web_url, web_timeout_sec, allow_api=True):
+def build_step_metrics(step_name, result, impala_web_url=None, web_timeout_sec=None, allow_api=False):
+    # Mantiene firma compatible con llamadas existentes; ahora el enriquecimiento viene por Elasticsearch.
+    _ = impala_web_url
+    _ = web_timeout_sec
+    _ = allow_api
+
     combined_output = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
     query_id = extract_query_id(combined_output)
+    elapsed_sec = to_float_metric(result.get("elapsed_sec"))
 
     metrics = {
         "step": step_name,
@@ -746,49 +1090,16 @@ def build_step_metrics(step_name, result, impala_web_url, web_timeout_sec, allow
         "query_id": query_id,
         "started_at_utc": result.get("started_at_utc"),
         "ended_at_utc": result.get("ended_at_utc"),
-        "elapsed_wall_sec": result.get("elapsed_sec"),
+        "elapsed_wall_sec": elapsed_sec,
+        "duration_ms": elapsed_sec * 1000.0 if elapsed_sec is not None else None,
         "api_duration_ms": None,
         "peak_memory_bytes": None,
-        "cpu_user_pct_avg": None,
-        "cpu_sys_pct_avg": None,
-        "cpu_iowait_pct_avg": None,
-        "metric_source": "",
+        "memory_total_bytes": None,
+        "cpu_total": None,
+        "metric_source": "wall_clock_only",
         "metric_warnings": [],
     }
-
-    source_tags = []
-
-    if allow_api and impala_web_url and query_id:
-        api_metrics = collect_api_metrics(query_id, impala_web_url, web_timeout_sec)
-        for key in ("api_duration_ms", "peak_memory_bytes", "cpu_user_pct_avg", "cpu_sys_pct_avg", "cpu_iowait_pct_avg"):
-            if api_metrics.get(key) is not None:
-                metrics[key] = api_metrics[key]
-
-        if api_metrics.get("sources"):
-            source_tags.extend(api_metrics.get("sources"))
-        if api_metrics.get("warnings"):
-            metrics["metric_warnings"].extend(api_metrics.get("warnings"))
-
-    needs_profile_fallback = (
-        metrics["peak_memory_bytes"] is None
-        or metrics["cpu_user_pct_avg"] is None
-        or metrics["cpu_sys_pct_avg"] is None
-        or metrics["cpu_iowait_pct_avg"] is None
-    )
-
-    if needs_profile_fallback and combined_output.strip():
-        profile_metrics = extract_profile_text_metrics(combined_output)
-        for key in ("peak_memory_bytes", "cpu_user_pct_avg", "cpu_sys_pct_avg", "cpu_iowait_pct_avg"):
-            if metrics.get(key) is None and profile_metrics.get(key) is not None:
-                metrics[key] = profile_metrics[key]
-
-        if any(profile_metrics.values()):
-            source_tags.append("profile_text")
-
-    if not source_tags:
-        source_tags.append("wall_clock_only")
-
-    metrics["metric_source"] = ",".join(source_tags)
+    metrics["api_duration_ms"] = metrics["duration_ms"]
     return metrics
 
 
@@ -819,13 +1130,13 @@ def print_metrics_summary(metrics_rows):
             )
         )
         print(
-            "  source={0} duration_ms={1} peak_mem_mb={2} cpu_user={3}% cpu_sys={4}% cpu_iowait={5}%".format(
+            "  source={0} duration_ms={1} mem_total_mb={2} cpu_total={3}".format(
                 row["metric_source"],
-                "{0:.2f}".format(row["api_duration_ms"]) if row["api_duration_ms"] is not None else "n/a",
-                format_mb(row["peak_memory_bytes"]),
-                format_pct(row["cpu_user_pct_avg"]),
-                format_pct(row["cpu_sys_pct_avg"]),
-                format_pct(row["cpu_iowait_pct_avg"]),
+                "{0:.2f}".format(to_float_metric(row.get("duration_ms")))
+                if to_float_metric(row.get("duration_ms")) is not None
+                else "n/a",
+                format_mb(row.get("memory_total_bytes") if row.get("memory_total_bytes") is not None else row.get("peak_memory_bytes")),
+                "{0:.3f}".format(to_float_metric(row.get("cpu_total"))) if to_float_metric(row.get("cpu_total")) is not None else "n/a",
             )
         )
         if row.get("metric_warnings"):
@@ -1078,27 +1389,27 @@ def format_run_metric_series(run_metrics, metric_key, formatter):
 
 def aggregate_step2_side_metrics(run_metrics):
     aggregated = {
+        "duration_ms": None,
         "elapsed_wall_sec": None,
         "peak_memory_bytes": None,
-        "cpu_user_pct_avg": None,
-        "cpu_sys_pct_avg": None,
-        "cpu_iowait_pct_avg": None,
+        "memory_total_bytes": None,
+        "cpu_total": None,
+        "duration_ms_sample_count": 0,
         "elapsed_wall_sec_sample_count": 0,
         "peak_memory_bytes_sample_count": 0,
-        "cpu_user_pct_avg_sample_count": 0,
-        "cpu_sys_pct_avg_sample_count": 0,
-        "cpu_iowait_pct_avg_sample_count": 0,
+        "memory_total_bytes_sample_count": 0,
+        "cpu_total_sample_count": 0,
         "metric_source": "",
         "metric_warnings": [],
         "run_count": len(run_metrics or []),
     }
 
     metric_keys = (
+        "duration_ms",
         "elapsed_wall_sec",
         "peak_memory_bytes",
-        "cpu_user_pct_avg",
-        "cpu_sys_pct_avg",
-        "cpu_iowait_pct_avg",
+        "memory_total_bytes",
+        "cpu_total",
     )
     for metric_key in metric_keys:
         values = metric_values_from_runs(run_metrics, metric_key)
@@ -1169,7 +1480,7 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
         lines.append("Motivo: {0}".format(step2_summary.get("reason", "n/a")))
         return "\n".join(lines)
 
-    lines.append("Metodo: ejecucion directa de cada query en modo read-only.")
+    lines.append("Metodo: ejecucion directa de cada query en modo read-only + lookup diferido en Elasticsearch.")
     lines.append(
         "Politica: {0} | runs por query: {1}".format(
             step2_summary.get("policy", "n/a"),
@@ -1193,8 +1504,8 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
         "Series tiempo original: {0}".format(
             format_run_metric_series(
                 original_runs,
-                "elapsed_wall_sec",
-                lambda v: "n/a" if v is None else "{0:.3f}s".format(v),
+                "duration_ms",
+                lambda v: "n/a" if v is None else "{0:.2f}ms".format(v),
             )
         )
     )
@@ -1202,8 +1513,8 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
         "Series tiempo refactor: {0}".format(
             format_run_metric_series(
                 refactor_runs,
-                "elapsed_wall_sec",
-                lambda v: "n/a" if v is None else "{0:.3f}s".format(v),
+                "duration_ms",
+                lambda v: "n/a" if v is None else "{0:.2f}ms".format(v),
             )
         )
     )
@@ -1212,61 +1523,37 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
 
     lines.append(
         format_efficiency_line(
-            "Tiempo wall-clock [n_orig={0}, n_ref={1}]".format(
-                original_metrics.get("elapsed_wall_sec_sample_count", 0),
-                refactor_metrics.get("elapsed_wall_sec_sample_count", 0),
+            "Tiempo query duration_ms [n_orig={0}, n_ref={1}]".format(
+                original_metrics.get("duration_ms_sample_count", 0),
+                refactor_metrics.get("duration_ms_sample_count", 0),
             ),
-            original_metrics.get("elapsed_wall_sec"),
-            refactor_metrics.get("elapsed_wall_sec"),
-            lambda v: "n/a" if v is None else "{0:.3f}s".format(v),
+            original_metrics.get("duration_ms"),
+            refactor_metrics.get("duration_ms"),
+            lambda v: "n/a" if v is None else "{0:.2f}ms".format(v),
             lower_is_better=True,
         )
     )
     lines.append(
         format_efficiency_line(
-            "Memoria pico [n_orig={0}, n_ref={1}]".format(
-                original_metrics.get("peak_memory_bytes_sample_count", 0),
-                refactor_metrics.get("peak_memory_bytes_sample_count", 0),
+            "Memoria total host-sum [n_orig={0}, n_ref={1}]".format(
+                original_metrics.get("memory_total_bytes_sample_count", 0),
+                refactor_metrics.get("memory_total_bytes_sample_count", 0),
             ),
-            original_metrics.get("peak_memory_bytes"),
-            refactor_metrics.get("peak_memory_bytes"),
+            original_metrics.get("memory_total_bytes"),
+            refactor_metrics.get("memory_total_bytes"),
             lambda v: "n/a" if v is None else "{0:.2f}MB".format(v / (1024.0 * 1024.0)),
             lower_is_better=True,
         )
     )
     lines.append(
         format_efficiency_line(
-            "CPU user promedio [n_orig={0}, n_ref={1}]".format(
-                original_metrics.get("cpu_user_pct_avg_sample_count", 0),
-                refactor_metrics.get("cpu_user_pct_avg_sample_count", 0),
+            "CPU total host-sum [n_orig={0}, n_ref={1}]".format(
+                original_metrics.get("cpu_total_sample_count", 0),
+                refactor_metrics.get("cpu_total_sample_count", 0),
             ),
-            original_metrics.get("cpu_user_pct_avg"),
-            refactor_metrics.get("cpu_user_pct_avg"),
-            lambda v: "n/a" if v is None else "{0:.2f}%".format(v),
-            lower_is_better=True,
-        )
-    )
-    lines.append(
-        format_efficiency_line(
-            "CPU sys promedio [n_orig={0}, n_ref={1}]".format(
-                original_metrics.get("cpu_sys_pct_avg_sample_count", 0),
-                refactor_metrics.get("cpu_sys_pct_avg_sample_count", 0),
-            ),
-            original_metrics.get("cpu_sys_pct_avg"),
-            refactor_metrics.get("cpu_sys_pct_avg"),
-            lambda v: "n/a" if v is None else "{0:.2f}%".format(v),
-            lower_is_better=True,
-        )
-    )
-    lines.append(
-        format_efficiency_line(
-            "CPU iowait promedio [n_orig={0}, n_ref={1}]".format(
-                original_metrics.get("cpu_iowait_pct_avg_sample_count", 0),
-                refactor_metrics.get("cpu_iowait_pct_avg_sample_count", 0),
-            ),
-            original_metrics.get("cpu_iowait_pct_avg"),
-            refactor_metrics.get("cpu_iowait_pct_avg"),
-            lambda v: "n/a" if v is None else "{0:.2f}%".format(v),
+            original_metrics.get("cpu_total"),
+            refactor_metrics.get("cpu_total"),
+            lambda v: "n/a" if v is None else "{0:.3f}".format(v),
             lower_is_better=True,
         )
     )
@@ -1508,15 +1795,26 @@ def main():
         help="Archivo para guardar stdout de la ejecucion (si --run).",
     )
     parser.add_argument(
-        "--impala-web-url",
-        default="",
-        help="URL base del web UI de Impala para metricas (ej: http://host:25000).",
+        "--elastic-env-file",
+        default=DEFAULT_ELASTIC_ENV_FILE,
+        help="Ruta al archivo .env con credenciales de Elasticsearch.",
     )
     parser.add_argument(
-        "--impala-web-timeout",
+        "--elastic-index",
+        default=DEFAULT_ELASTIC_INDEX,
+        help="Indice base de Elasticsearch para metricas de queries.",
+    )
+    parser.add_argument(
+        "--elastic-wait-sec",
         type=int,
-        default=10,
-        help="Timeout (segundos) para requests al API web de Impala.",
+        default=DEFAULT_ELASTIC_WAIT_SEC,
+        help="Segundos de espera antes del lookup en Elasticsearch luego de la ultima query de Step 2.",
+    )
+    parser.add_argument(
+        "--elastic-timeout",
+        type=int,
+        default=DEFAULT_ELASTIC_TIMEOUT_SEC,
+        help="Timeout (segundos) para requests HTTP a Elasticsearch.",
     )
     parser.add_argument(
         "--metrics-json",
@@ -1539,6 +1837,10 @@ def main():
 
     if args.step2_runs <= 0:
         raise ValueError("--step2-runs debe ser mayor que 0.")
+    if args.elastic_wait_sec < 0:
+        raise ValueError("--elastic-wait-sec no puede ser negativo.")
+    if args.elastic_timeout <= 0:
+        raise ValueError("--elastic-timeout debe ser mayor que 0.")
 
     args.impala_shell = resolve_impala_shell_command(args.impala_shell)
 
@@ -1578,7 +1880,7 @@ def main():
     step2_summary = {
         "status": "SKIPPED",
         "reason": "Step 2 aun no ejecutado",
-        "method": "direct_query",
+        "method": "direct_query_elastic_lookup",
         "policy": "alternating",
         "runs": args.step2_runs,
         "original_metrics": None,
@@ -1590,11 +1892,14 @@ def main():
     }
     comparison_samples_by_pair = {}
 
-    impala_web_url = args.impala_web_url.strip() or infer_impala_web_url(args.impala_opts)
-    if impala_web_url:
-        log_info("metricas API habilitadas via {0}".format(impala_web_url))
-    else:
-        log_info("metricas API no configuradas; se usara wall-clock y fallback de PROFILE cuando exista.")
+    impala_web_url = ""
+    log_info(
+        "Step 2 usara metricas de Elasticsearch (indice={0}, env_file={1}, wait={2}s).".format(
+            args.elastic_index,
+            args.elastic_env_file,
+            args.elastic_wait_sec,
+        )
+    )
 
     execute_generated_sql = args.run or use_sql_mode
     log_info("Ejecucion de SQL generado: {0}".format("si" if execute_generated_sql else "no"))
@@ -1628,8 +1933,8 @@ def main():
                     "create_original_temp_table",
                     create_original_result,
                     impala_web_url,
-                    args.impala_web_timeout,
-                    allow_api=True,
+                    args.elastic_timeout,
+                    allow_api=False,
                 )
             )
             if create_original_result["returncode"] != 0:
@@ -1649,8 +1954,8 @@ def main():
                     "create_refactor_temp_table",
                     create_refactor_result,
                     impala_web_url,
-                    args.impala_web_timeout,
-                    allow_api=True,
+                    args.elastic_timeout,
+                    allow_api=False,
                 )
             )
             if create_refactor_result["returncode"] != 0:
@@ -1719,8 +2024,8 @@ def main():
                     "execute_comparison_sql",
                     compare_result,
                     impala_web_url,
-                    args.impala_web_timeout,
-                    allow_api=True,
+                    args.elastic_timeout,
+                    allow_api=False,
                 )
             )
 
@@ -1747,14 +2052,16 @@ def main():
                 log_info("STEP 1 PASS: STRICT_100_RESULT=OK para todos los pares")
                 if use_sql_mode:
                     run_total = int(args.step2_runs)
+                    elastic_config = resolve_elastic_config(args.elastic_env_file, args.elastic_index)
                     log_info(
-                        "STEP 2 START: ejecucion read-only directa, {0} runs por query, orden alternado".format(
+                        "STEP 2 START: ejecucion read-only directa, {0} runs por query, orden alternado; metricas via Elasticsearch.".format(
                             run_total
                         )
                     )
 
                     original_run_metrics = []
                     refactor_run_metrics = []
+                    step2_run_metrics = []
 
                     for run_idx in range(run_total):
                         run_number = run_idx + 1
@@ -1789,13 +2096,14 @@ def main():
                                 step_name,
                                 run_result,
                                 impala_web_url,
-                                args.impala_web_timeout,
-                                allow_api=True,
+                                args.elastic_timeout,
+                                allow_api=False,
                             )
                             run_metric["query_side"] = side
                             run_metric["run_index"] = run_number
                             run_metric["round_order"] = round_order
                             metrics_rows.append(run_metric)
+                            step2_run_metrics.append(run_metric)
 
                             if side == "original":
                                 original_run_metrics.append(run_metric)
@@ -1806,7 +2114,7 @@ def main():
                                 step2_summary = {
                                     "status": "ERROR",
                                     "reason": "Fallo Step 2 en run {0} lado {1}".format(run_number, side),
-                                    "method": "direct_query",
+                                    "method": "direct_query_elastic_lookup",
                                     "policy": "alternating",
                                     "runs": run_total,
                                     "original_metrics": aggregate_step2_side_metrics(original_run_metrics),
@@ -1818,10 +2126,29 @@ def main():
                                 }
                                 raise RuntimeError(format_impala_error(step_name, run_result))
 
+                    try:
+                        enrich_step2_metrics_from_elastic(
+                            step2_run_metrics,
+                            elastic_config,
+                            args.elastic_wait_sec,
+                            args.elastic_timeout,
+                        )
+                        log_info("STEP 2 METRICS: enriquecimiento Elasticsearch completado")
+                    except Exception as exc:
+                        log_warn("STEP 2 METRICS: lookup Elasticsearch fallo, se usa fallback wall-clock ({0})".format(exc))
+                        for run_metric in step2_run_metrics:
+                            run_metric["duration_ms"] = wall_clock_ms_from_metric(run_metric)
+                            run_metric["api_duration_ms"] = run_metric["duration_ms"]
+                            run_metric["cpu_total"] = None
+                            run_metric["memory_total_bytes"] = None
+                            run_metric["peak_memory_bytes"] = None
+                            run_metric["metric_source"] = "wall_clock_backup"
+                            append_metric_warning(run_metric, "elastic_lookup_error:{0}".format(exc))
+
                     step2_summary = {
                         "status": "COMPLETED",
                         "reason": "",
-                        "method": "direct_query",
+                        "method": "direct_query_elastic_lookup",
                         "policy": "alternating",
                         "runs": run_total,
                         "original_metrics": aggregate_step2_side_metrics(original_run_metrics),
@@ -1852,7 +2179,7 @@ def main():
             step2_summary = {
                 "status": "SKIPPED",
                 "reason": "Step 2 requiere que Step 1 se ejecute",
-                "method": "direct_query",
+                "method": "direct_query_elastic_lookup",
                 "policy": "alternating",
                 "runs": args.step2_runs,
                 "original_metrics": None,
@@ -1880,8 +2207,8 @@ def main():
                         "drop_temp_table:{0}".format(temp_table),
                         drop_result,
                         impala_web_url,
-                        args.impala_web_timeout,
-                        allow_api=True,
+                        args.elastic_timeout,
+                        allow_api=False,
                     )
                 )
                 if drop_result["returncode"] != 0:
