@@ -34,7 +34,8 @@ Tambien incluye muestras de diferencias lado a lado (hasta 50 por lado) cuando h
 2. **Step 2 - comparacion de eficiencia (solo si Step 1 pasa)**
 	- Re-ejecuta ambas queries en modo read-only para comparar tiempo y recursos.
 	- Metodo usado: ejecucion directa de cada query (sin `CREATE`/`INSERT`/`DROP` en Step 2) para medir tiempo y recursos sobre la query real.
-	- Reporta tiempo, memoria pico y CPU (cuando hay datos).
+	- Ejecuta cada query varias veces (`--step2-runs`, por defecto `5`) con orden alternado por ronda para reducir sesgo por estado del cluster.
+	- Compara por mediana de tiempo/memoria/CPU y muestra series por corrida.
 
 ## Modo 1: comparar tablas existentes (`pairs`)
 
@@ -108,7 +109,7 @@ Por defecto se genera `comparison_report.txt` con:
 
 - resumen de Step 1 por par (PASS/FAIL y metricas clave)
 - muestras lado a lado en caso de mismatch (`A_ONLY` vs `B_ONLY`)
-- resumen de Step 2 (si aplica) con comparacion original vs refactor
+- resumen de Step 2 (si aplica) con comparacion original vs refactor por medianas
 
 Puedes cambiar la ruta de salida:
 
@@ -135,6 +136,7 @@ python comparar_tablas.py ... --metrics-json metricas.json
 - `--impala-web-timeout`: timeout de llamadas HTTP.
 - `--metrics-json`: salida JSON de metricas.
 - `--human-report`: salida TXT legible (por defecto `comparison_report.txt`).
+- `--step2-runs`: cantidad de corridas por query en Step 2 (por defecto `5`, en orden alternado).
 
 ## Windows: error comun con impala-shell
 

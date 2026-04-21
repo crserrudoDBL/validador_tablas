@@ -22,6 +22,7 @@ except ImportError:
 
 QUERY_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16}:[0-9a-fA-F]{16})")
 DEFAULT_SAMPLE_SIZE = 50
+DEFAULT_STEP2_RUNS = 5
 DEFAULT_HUMAN_REPORT_PATH = "comparison_report.txt"
 SAMPLE_VALUE_SEPARATOR = " ||| "
 
@@ -1033,6 +1034,91 @@ def format_efficiency_line(label, original_value, refactor_value, formatter, low
     )
 
 
+def median_value(values):
+    if not values:
+        return None
+
+    ordered = sorted(values)
+    size = len(ordered)
+    mid = size // 2
+    if size % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def metric_values_from_runs(run_metrics, metric_key):
+    values = []
+    for run_metric in run_metrics or []:
+        parsed = to_float_metric(run_metric.get(metric_key))
+        if parsed is not None:
+            values.append(parsed)
+    return values
+
+
+def run_index_value(run_metric):
+    try:
+        return int(run_metric.get("run_index", 0))
+    except Exception:
+        return 0
+
+
+def format_run_metric_series(run_metrics, metric_key, formatter):
+    if not run_metrics:
+        return "n/a"
+
+    parts = []
+    ordered_runs = sorted(run_metrics, key=run_index_value)
+    for run_metric in ordered_runs:
+        run_number = run_metric.get("run_index", "?")
+        parsed = to_float_metric(run_metric.get(metric_key))
+        formatted = formatter(parsed) if parsed is not None else "n/a"
+        parts.append("r{0}={1}".format(run_number, formatted))
+    return ", ".join(parts)
+
+
+def aggregate_step2_side_metrics(run_metrics):
+    aggregated = {
+        "elapsed_wall_sec": None,
+        "peak_memory_bytes": None,
+        "cpu_user_pct_avg": None,
+        "cpu_sys_pct_avg": None,
+        "cpu_iowait_pct_avg": None,
+        "elapsed_wall_sec_sample_count": 0,
+        "peak_memory_bytes_sample_count": 0,
+        "cpu_user_pct_avg_sample_count": 0,
+        "cpu_sys_pct_avg_sample_count": 0,
+        "cpu_iowait_pct_avg_sample_count": 0,
+        "metric_source": "",
+        "metric_warnings": [],
+        "run_count": len(run_metrics or []),
+    }
+
+    metric_keys = (
+        "elapsed_wall_sec",
+        "peak_memory_bytes",
+        "cpu_user_pct_avg",
+        "cpu_sys_pct_avg",
+        "cpu_iowait_pct_avg",
+    )
+    for metric_key in metric_keys:
+        values = metric_values_from_runs(run_metrics, metric_key)
+        aggregated[metric_key] = median_value(values)
+        aggregated[metric_key + "_sample_count"] = len(values)
+
+    source_seen = []
+    for run_metric in run_metrics or []:
+        source = to_text(run_metric.get("metric_source", "")).strip()
+        if source and source not in source_seen:
+            source_seen.append(source)
+        for warning in run_metric.get("metric_warnings") or []:
+            warning_text = to_text(warning)
+            if warning_text and warning_text not in aggregated["metric_warnings"]:
+                aggregated["metric_warnings"].append(warning_text)
+
+    aggregated["metric_source"] = ",".join(source_seen) if source_seen else "wall_clock_only"
+    return aggregated
+
+
 def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_summary, sample_limit):
     lines = []
     lines.append("VALIDADOR DE QUERIES - REPORTE HUMANO")
@@ -1084,20 +1170,52 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
         return "\n".join(lines)
 
     lines.append("Metodo: ejecucion directa de cada query en modo read-only.")
+    lines.append(
+        "Politica: {0} | runs por query: {1}".format(
+            step2_summary.get("policy", "n/a"),
+            step2_summary.get("runs", "n/a"),
+        )
+    )
     if step2_summary.get("original_rowcount") or step2_summary.get("refactor_rowcount"):
         lines.append("Rowcount original: {0}".format(step2_summary.get("original_rowcount") or "n/a"))
         lines.append("Rowcount refactor: {0}".format(step2_summary.get("refactor_rowcount") or "n/a"))
 
     original_metrics = step2_summary.get("original_metrics") or {}
     refactor_metrics = step2_summary.get("refactor_metrics") or {}
+    original_runs = step2_summary.get("original_runs") or []
+    refactor_runs = step2_summary.get("refactor_runs") or []
 
     lines.append("Fuente metricas original: {0}".format(original_metrics.get("metric_source", "n/a")))
     lines.append("Fuente metricas refactor: {0}".format(refactor_metrics.get("metric_source", "n/a")))
     lines.append("")
 
     lines.append(
+        "Series tiempo original: {0}".format(
+            format_run_metric_series(
+                original_runs,
+                "elapsed_wall_sec",
+                lambda v: "n/a" if v is None else "{0:.3f}s".format(v),
+            )
+        )
+    )
+    lines.append(
+        "Series tiempo refactor: {0}".format(
+            format_run_metric_series(
+                refactor_runs,
+                "elapsed_wall_sec",
+                lambda v: "n/a" if v is None else "{0:.3f}s".format(v),
+            )
+        )
+    )
+    lines.append("")
+    lines.append("Comparacion por mediana:")
+
+    lines.append(
         format_efficiency_line(
-            "Tiempo wall-clock",
+            "Tiempo wall-clock [n_orig={0}, n_ref={1}]".format(
+                original_metrics.get("elapsed_wall_sec_sample_count", 0),
+                refactor_metrics.get("elapsed_wall_sec_sample_count", 0),
+            ),
             original_metrics.get("elapsed_wall_sec"),
             refactor_metrics.get("elapsed_wall_sec"),
             lambda v: "n/a" if v is None else "{0:.3f}s".format(v),
@@ -1106,7 +1224,10 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
     )
     lines.append(
         format_efficiency_line(
-            "Memoria pico",
+            "Memoria pico [n_orig={0}, n_ref={1}]".format(
+                original_metrics.get("peak_memory_bytes_sample_count", 0),
+                refactor_metrics.get("peak_memory_bytes_sample_count", 0),
+            ),
             original_metrics.get("peak_memory_bytes"),
             refactor_metrics.get("peak_memory_bytes"),
             lambda v: "n/a" if v is None else "{0:.2f}MB".format(v / (1024.0 * 1024.0)),
@@ -1115,7 +1236,10 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
     )
     lines.append(
         format_efficiency_line(
-            "CPU user promedio",
+            "CPU user promedio [n_orig={0}, n_ref={1}]".format(
+                original_metrics.get("cpu_user_pct_avg_sample_count", 0),
+                refactor_metrics.get("cpu_user_pct_avg_sample_count", 0),
+            ),
             original_metrics.get("cpu_user_pct_avg"),
             refactor_metrics.get("cpu_user_pct_avg"),
             lambda v: "n/a" if v is None else "{0:.2f}%".format(v),
@@ -1124,7 +1248,10 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
     )
     lines.append(
         format_efficiency_line(
-            "CPU sys promedio",
+            "CPU sys promedio [n_orig={0}, n_ref={1}]".format(
+                original_metrics.get("cpu_sys_pct_avg_sample_count", 0),
+                refactor_metrics.get("cpu_sys_pct_avg_sample_count", 0),
+            ),
             original_metrics.get("cpu_sys_pct_avg"),
             refactor_metrics.get("cpu_sys_pct_avg"),
             lambda v: "n/a" if v is None else "{0:.2f}%".format(v),
@@ -1133,7 +1260,10 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
     )
     lines.append(
         format_efficiency_line(
-            "CPU iowait promedio",
+            "CPU iowait promedio [n_orig={0}, n_ref={1}]".format(
+                original_metrics.get("cpu_iowait_pct_avg_sample_count", 0),
+                refactor_metrics.get("cpu_iowait_pct_avg_sample_count", 0),
+            ),
             original_metrics.get("cpu_iowait_pct_avg"),
             refactor_metrics.get("cpu_iowait_pct_avg"),
             lambda v: "n/a" if v is None else "{0:.2f}%".format(v),
@@ -1398,8 +1528,17 @@ def main():
         default=DEFAULT_HUMAN_REPORT_PATH,
         help="Archivo TXT de salida para reporte humano lado a lado.",
     )
+    parser.add_argument(
+        "--step2-runs",
+        type=int,
+        default=DEFAULT_STEP2_RUNS,
+        help="Cantidad de ejecuciones por query en Step 2 (alternadas para reducir sesgo).",
+    )
     parser.set_defaults(auto_columns=True)
     args = parser.parse_args()
+
+    if args.step2_runs <= 0:
+        raise ValueError("--step2-runs debe ser mayor que 0.")
 
     args.impala_shell = resolve_impala_shell_command(args.impala_shell)
 
@@ -1440,8 +1579,12 @@ def main():
         "status": "SKIPPED",
         "reason": "Step 2 aun no ejecutado",
         "method": "direct_query",
+        "policy": "alternating",
+        "runs": args.step2_runs,
         "original_metrics": None,
         "refactor_metrics": None,
+        "original_runs": [],
+        "refactor_runs": [],
         "original_rowcount": "",
         "refactor_rowcount": "",
     }
@@ -1603,63 +1746,92 @@ def main():
             if step1_summary.get("all_pass"):
                 log_info("STEP 1 PASS: STRICT_100_RESULT=OK para todos los pares")
                 if use_sql_mode:
-                    log_info("STEP 2 START: ejecucion read-only de query original y refactor")
+                    run_total = int(args.step2_runs)
+                    log_info(
+                        "STEP 2 START: ejecucion read-only directa, {0} runs por query, orden alternado".format(
+                            run_total
+                        )
+                    )
 
-                    original_probe_result = run_impala_query_timed(
-                        original_query,
-                        args.impala_shell,
-                        args.impala_opts,
-                        show_profiles=True,
-                        step_name="step2_readonly_original_direct",
-                        delimited=True,
-                    )
-                    original_probe_metrics = build_step_metrics(
-                        "step2_readonly_original_direct",
-                        original_probe_result,
-                        impala_web_url,
-                        args.impala_web_timeout,
-                        allow_api=True,
-                    )
-                    metrics_rows.append(original_probe_metrics)
-                    if original_probe_result["returncode"] != 0:
-                        step2_summary["status"] = "ERROR"
-                        step2_summary["reason"] = "Fallo la ejecucion read-only de la query original"
-                        step2_summary["original_metrics"] = original_probe_metrics
-                        raise RuntimeError(format_impala_error("step2_readonly_original", original_probe_result))
+                    original_run_metrics = []
+                    refactor_run_metrics = []
 
-                    refactor_probe_result = run_impala_query_timed(
-                        refactor_query,
-                        args.impala_shell,
-                        args.impala_opts,
-                        show_profiles=True,
-                        step_name="step2_readonly_refactor_direct",
-                        delimited=True,
-                    )
-                    refactor_probe_metrics = build_step_metrics(
-                        "step2_readonly_refactor_direct",
-                        refactor_probe_result,
-                        impala_web_url,
-                        args.impala_web_timeout,
-                        allow_api=True,
-                    )
-                    metrics_rows.append(refactor_probe_metrics)
-                    if refactor_probe_result["returncode"] != 0:
-                        step2_summary["status"] = "ERROR"
-                        step2_summary["reason"] = "Fallo la ejecucion read-only de la query refactor"
-                        step2_summary["original_metrics"] = original_probe_metrics
-                        step2_summary["refactor_metrics"] = refactor_probe_metrics
-                        raise RuntimeError(format_impala_error("step2_readonly_refactor", refactor_probe_result))
+                    for run_idx in range(run_total):
+                        run_number = run_idx + 1
+                        if run_idx % 2 == 0:
+                            run_plan = [("original", original_query), ("refactor", refactor_query)]
+                        else:
+                            run_plan = [("refactor", refactor_query), ("original", original_query)]
+
+                        log_info(
+                            "STEP 2 ROUND {0}/{1}: orden={2}->{3}".format(
+                                run_number,
+                                run_total,
+                                run_plan[0][0],
+                                run_plan[1][0],
+                            )
+                        )
+
+                        for round_order, plan_item in enumerate(run_plan, 1):
+                            side = plan_item[0]
+                            query_text = plan_item[1]
+                            step_name = "step2_readonly_{0}_run{1}".format(side, run_number)
+
+                            run_result = run_impala_query_timed(
+                                query_text,
+                                args.impala_shell,
+                                args.impala_opts,
+                                show_profiles=True,
+                                step_name=step_name,
+                                delimited=True,
+                            )
+                            run_metric = build_step_metrics(
+                                step_name,
+                                run_result,
+                                impala_web_url,
+                                args.impala_web_timeout,
+                                allow_api=True,
+                            )
+                            run_metric["query_side"] = side
+                            run_metric["run_index"] = run_number
+                            run_metric["round_order"] = round_order
+                            metrics_rows.append(run_metric)
+
+                            if side == "original":
+                                original_run_metrics.append(run_metric)
+                            else:
+                                refactor_run_metrics.append(run_metric)
+
+                            if run_result["returncode"] != 0:
+                                step2_summary = {
+                                    "status": "ERROR",
+                                    "reason": "Fallo Step 2 en run {0} lado {1}".format(run_number, side),
+                                    "method": "direct_query",
+                                    "policy": "alternating",
+                                    "runs": run_total,
+                                    "original_metrics": aggregate_step2_side_metrics(original_run_metrics),
+                                    "refactor_metrics": aggregate_step2_side_metrics(refactor_run_metrics),
+                                    "original_runs": original_run_metrics,
+                                    "refactor_runs": refactor_run_metrics,
+                                    "original_rowcount": "",
+                                    "refactor_rowcount": "",
+                                }
+                                raise RuntimeError(format_impala_error(step_name, run_result))
 
                     step2_summary = {
                         "status": "COMPLETED",
                         "reason": "",
                         "method": "direct_query",
-                        "original_metrics": original_probe_metrics,
-                        "refactor_metrics": refactor_probe_metrics,
+                        "policy": "alternating",
+                        "runs": run_total,
+                        "original_metrics": aggregate_step2_side_metrics(original_run_metrics),
+                        "refactor_metrics": aggregate_step2_side_metrics(refactor_run_metrics),
+                        "original_runs": original_run_metrics,
+                        "refactor_runs": refactor_run_metrics,
                         "original_rowcount": "",
                         "refactor_rowcount": "",
                     }
-                    log_info("STEP 2 COMPLETED: comparacion read-only finalizada")
+                    log_info("STEP 2 COMPLETED: comparacion read-only multi-run finalizada")
                 else:
                     step2_summary["status"] = "SKIPPED"
                     step2_summary["reason"] = "Step 2 read-only solo aplica para modo sql"
@@ -1681,8 +1853,12 @@ def main():
                 "status": "SKIPPED",
                 "reason": "Step 2 requiere que Step 1 se ejecute",
                 "method": "direct_query",
+                "policy": "alternating",
+                "runs": args.step2_runs,
                 "original_metrics": None,
                 "refactor_metrics": None,
+                "original_runs": [],
+                "refactor_runs": [],
                 "original_rowcount": "",
                 "refactor_rowcount": "",
             }
