@@ -648,6 +648,10 @@ def extract_elastic_query_metrics(doc):
 
     memory_total = sum_prefixed_numeric_fields(doc, "mem_per_host.")
     if memory_total is None:
+        cluster_memory_series = parse_numeric_series(pick_first(doc, ["cluster_memory_admitted"]))
+        if cluster_memory_series:
+            memory_total = sum(cluster_memory_series)
+    if memory_total is None:
         metrics["warnings"].append("elastic_mem_missing")
     else:
         metrics["memory_total_bytes"] = memory_total
