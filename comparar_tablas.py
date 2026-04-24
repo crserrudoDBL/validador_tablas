@@ -10,8 +10,15 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import traceback
 import time
 from datetime import datetime
+
+try:
+    import queue as queue_module
+except ImportError:
+    queue_module = __import__("Queue")
 
 try:
     from urllib.parse import quote as url_quote
@@ -37,6 +44,9 @@ except NameError:
     text_type = str
 
 
+LOG_WRITE_LOCK = threading.Lock()
+
+
 def decode_if_bytes(value):
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")
@@ -57,25 +67,27 @@ def to_text(value):
 
 def write_stderr_line(message):
     line = to_text(message) + u"\n"
-    try:
-        sys.stderr.write(line)
-    except Exception:
-        # Python 2 stderr may be bytes-only under some console encodings.
-        sys.stderr.write(line.encode("utf-8", "replace"))
+    with LOG_WRITE_LOCK:
+        try:
+            sys.stderr.write(line)
+        except Exception:
+            # Python 2 stderr may be bytes-only under some console encodings.
+            sys.stderr.write(line.encode("utf-8", "replace"))
 
 
 def write_stdout_line(message):
     line = to_text(message) + u"\n"
-    try:
-        sys.stdout.write(line)
-    except Exception:
-        # Python 2 stdout may be bytes-only under some console encodings.
-        sys.stdout.write(line.encode("utf-8", "replace"))
+    with LOG_WRITE_LOCK:
+        try:
+            sys.stdout.write(line)
+        except Exception:
+            # Python 2 stdout may be bytes-only under some console encodings.
+            sys.stdout.write(line.encode("utf-8", "replace"))
 
-    try:
-        sys.stdout.flush()
-    except Exception:
-        pass
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
 
 
 def log_info(message):
@@ -648,7 +660,7 @@ def extract_elastic_query_metrics(doc):
 
     memory_total = sum_prefixed_numeric_fields(doc, "mem_per_host.")
     if memory_total is None:
-        cluster_memory_series = parse_numeric_series(pick_first(doc, ["cluster_memory_admitted"]))
+        cluster_memory_series = parse_numeric_series(pick_first(doc, ["cluster_memory_admitted_bytes"]))
         if cluster_memory_series:
             memory_total = sum(cluster_memory_series)
     if memory_total is None:
@@ -1755,6 +1767,191 @@ def metric_block(pair_name, original_table, refactor_table, key_columns, compare
     return "\n".join(block)
 
 
+def build_step2_error_summary(run_total, reason, original_run_metrics, refactor_run_metrics):
+    return {
+        "status": "ERROR",
+        "reason": reason,
+        "method": "direct_query_elastic_lookup",
+        "policy": "alternating",
+        "runs": run_total,
+        "original_metrics": aggregate_step2_side_metrics(original_run_metrics),
+        "refactor_metrics": aggregate_step2_side_metrics(refactor_run_metrics),
+        "original_runs": original_run_metrics,
+        "refactor_runs": refactor_run_metrics,
+        "original_rowcount": "",
+        "refactor_rowcount": "",
+    }
+
+
+def execute_step2_query_worker(result_queue, side, query_text, run_number, round_order, args, impala_web_url):
+    step_name = "step2_readonly_{0}_run{1}".format(side, run_number)
+    try:
+        run_result = run_impala_query_timed(
+            query_text,
+            args.impala_shell,
+            args.impala_opts,
+            show_profiles=True,
+            step_name=step_name,
+            delimited=True,
+        )
+        run_metric = build_step_metrics(
+            step_name,
+            run_result,
+            impala_web_url,
+            args.elastic_timeout,
+            allow_api=False,
+        )
+        run_metric["query_side"] = side
+        run_metric["run_index"] = run_number
+        run_metric["round_order"] = round_order
+
+        result_queue.put(
+            {
+                "ok": True,
+                "side": side,
+                "run_index": run_number,
+                "round_order": round_order,
+                "step_name": step_name,
+                "run_result": run_result,
+                "run_metric": run_metric,
+            }
+        )
+    except Exception as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "side": side,
+                "run_index": run_number,
+                "round_order": round_order,
+                "step_name": step_name,
+                "error": to_text(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+
+
+def run_step2_sql_mode(original_query, refactor_query, args, metrics_rows, impala_web_url):
+    run_total = int(args.step2_runs)
+    elastic_config = resolve_elastic_config(args.elastic_env_file, args.elastic_index)
+    log_info(
+        "STEP 2 START: ejecucion read-only directa, {0} runs por query, pares concurrentes por run; metricas via Elasticsearch.".format(
+            run_total
+        )
+    )
+
+    original_run_metrics = []
+    refactor_run_metrics = []
+    step2_run_metrics = []
+
+    for run_idx in range(run_total):
+        run_number = run_idx + 1
+        if run_idx % 2 == 0:
+            run_plan = [("original", original_query), ("refactor", refactor_query)]
+        else:
+            run_plan = [("refactor", refactor_query), ("original", original_query)]
+
+        log_info(
+            "STEP 2 ROUND {0}/{1}: lanzando en paralelo ({2},{3})".format(
+                run_number,
+                run_total,
+                run_plan[0][0],
+                run_plan[1][0],
+            )
+        )
+
+        round_queue = queue_module.Queue()
+        round_threads = []
+        for round_order, plan_item in enumerate(run_plan, 1):
+            side = plan_item[0]
+            query_text = plan_item[1]
+            worker = threading.Thread(
+                target=execute_step2_query_worker,
+                args=(round_queue, side, query_text, run_number, round_order, args, impala_web_url),
+            )
+            worker.daemon = False
+            worker.start()
+            round_threads.append(worker)
+
+        for worker in round_threads:
+            worker.join()
+
+        round_results = []
+        while len(round_results) < len(run_plan):
+            round_results.append(round_queue.get())
+
+        round_results.sort(key=lambda item: item.get("round_order", 0))
+
+        for item in round_results:
+            side = item.get("side", "")
+            if not item.get("ok"):
+                reason = "Error interno Step 2 en run {0} lado {1}".format(run_number, side)
+                step2_summary = build_step2_error_summary(
+                    run_total,
+                    reason,
+                    original_run_metrics,
+                    refactor_run_metrics,
+                )
+                error_text = item.get("error") or "error desconocido"
+                trace_text = item.get("traceback") or ""
+                return step2_summary, "{0}. Detalle: {1}\n{2}".format(reason, error_text, trace_text)
+
+            run_result = item.get("run_result") or {}
+            run_metric = item.get("run_metric") or {}
+
+            metrics_rows.append(run_metric)
+            step2_run_metrics.append(run_metric)
+
+            if side == "original":
+                original_run_metrics.append(run_metric)
+            else:
+                refactor_run_metrics.append(run_metric)
+
+            if run_result.get("returncode") != 0:
+                reason = "Fallo Step 2 en run {0} lado {1}".format(run_number, side)
+                step2_summary = build_step2_error_summary(
+                    run_total,
+                    reason,
+                    original_run_metrics,
+                    refactor_run_metrics,
+                )
+                return step2_summary, format_impala_error(item.get("step_name") or "step2", run_result)
+
+    try:
+        enrich_step2_metrics_from_elastic(
+            step2_run_metrics,
+            elastic_config,
+            args.elastic_wait_sec,
+            args.elastic_timeout,
+        )
+        log_info("STEP 2 METRICS: enriquecimiento Elasticsearch completado")
+    except Exception as exc:
+        log_warn("STEP 2 METRICS: lookup Elasticsearch fallo, se usa fallback wall-clock ({0})".format(exc))
+        for run_metric in step2_run_metrics:
+            run_metric["duration_ms"] = wall_clock_ms_from_metric(run_metric)
+            run_metric["api_duration_ms"] = run_metric["duration_ms"]
+            run_metric["cpu_total"] = None
+            run_metric["memory_total_bytes"] = None
+            run_metric["peak_memory_bytes"] = None
+            run_metric["metric_source"] = "wall_clock_backup"
+            append_metric_warning(run_metric, "elastic_lookup_error:{0}".format(exc))
+
+    step2_summary = {
+        "status": "COMPLETED",
+        "reason": "",
+        "method": "direct_query_elastic_lookup",
+        "policy": "alternating",
+        "runs": run_total,
+        "original_metrics": aggregate_step2_side_metrics(original_run_metrics),
+        "refactor_metrics": aggregate_step2_side_metrics(refactor_run_metrics),
+        "original_runs": original_run_metrics,
+        "refactor_runs": refactor_run_metrics,
+        "original_rowcount": "",
+        "refactor_rowcount": "",
+    }
+    log_info("STEP 2 COMPLETED: comparacion read-only multi-run finalizada")
+    return step2_summary, ""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Valida equivalencia entre tablas (modo CSV) o queries (modo SQL).")
     parser.add_argument("--mode", choices=["auto", "pairs", "sql"], default="auto", help="Modo de ejecucion.")
@@ -1836,6 +2033,11 @@ def main():
         default=DEFAULT_STEP2_RUNS,
         help="Cantidad de ejecuciones por query en Step 2 (alternadas para reducir sesgo).",
     )
+    parser.add_argument(
+        "--skip-step1",
+        action="store_true",
+        help="Omite Step 1 y ejecuta directamente Step 2 (solo modo sql).",
+    )
     parser.set_defaults(auto_columns=True)
     args = parser.parse_args()
 
@@ -1864,6 +2066,9 @@ def main():
         use_sql_mode = False
     else:
         use_sql_mode = has_original_sql and has_refactor_sql
+
+    if args.skip_step1 and not use_sql_mode:
+        raise ValueError("--skip-step1 solo se permite en modo sql con --original-sql y --refactor-sql.")
 
     log_info("Modo de ejecucion seleccionado: {0}".format("sql" if use_sql_mode else "pairs"))
 
@@ -1905,7 +2110,9 @@ def main():
         )
     )
 
-    execute_generated_sql = args.run or use_sql_mode
+    execute_generated_sql = (args.run or use_sql_mode) and not args.skip_step1
+    if args.skip_step1:
+        log_info("STEP 1 sera omitido por parametro --skip-step1")
     log_info("Ejecucion de SQL generado: {0}".format("si" if execute_generated_sql else "no"))
 
     try:
@@ -1914,104 +2121,106 @@ def main():
             key_columns = split_list(args.key_columns)
             pair_name = args.pair_name.strip() or "sql_file_pair"
 
-            original_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "original")
-            refactor_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "refactor")
-            log_info("Tabla temporal original: {0}".format(original_table))
-            log_info("Tabla temporal refactor: {0}".format(refactor_table))
-
             log_info("Cargando y validando query SQL original")
             original_query = load_sql_query_for_ctas(args.original_sql)
             log_info("Cargando y validando query SQL refactor")
             refactor_query = load_sql_query_for_ctas(args.refactor_sql)
 
-            create_original_sql = "CREATE TABLE {0} AS {1}".format(original_table, original_query)
-            create_original_result = run_impala_query_timed(
-                create_original_sql,
-                args.impala_shell,
-                args.impala_opts,
-                show_profiles=True,
-                step_name="create_original_temp_table",
-            )
-            metrics_rows.append(
-                build_step_metrics(
-                    "create_original_temp_table",
-                    create_original_result,
-                    impala_web_url,
-                    args.elastic_timeout,
-                    allow_api=False,
-                )
-            )
-            if create_original_result["returncode"] != 0:
-                raise RuntimeError(format_impala_error("CREATE TABLE original", create_original_result))
-            temp_tables.append(original_table)
+            if not args.skip_step1:
+                original_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "original")
+                refactor_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "refactor")
+                log_info("Tabla temporal original: {0}".format(original_table))
+                log_info("Tabla temporal refactor: {0}".format(refactor_table))
 
-            create_refactor_sql = "CREATE TABLE {0} AS {1}".format(refactor_table, refactor_query)
-            create_refactor_result = run_impala_query_timed(
-                create_refactor_sql,
-                args.impala_shell,
-                args.impala_opts,
-                show_profiles=True,
-                step_name="create_refactor_temp_table",
-            )
-            metrics_rows.append(
-                build_step_metrics(
-                    "create_refactor_temp_table",
-                    create_refactor_result,
-                    impala_web_url,
-                    args.elastic_timeout,
-                    allow_api=False,
+                create_original_sql = "CREATE TABLE {0} AS {1}".format(original_table, original_query)
+                create_original_result = run_impala_query_timed(
+                    create_original_sql,
+                    args.impala_shell,
+                    args.impala_opts,
+                    show_profiles=True,
+                    step_name="create_original_temp_table",
                 )
-            )
-            if create_refactor_result["returncode"] != 0:
-                raise RuntimeError(format_impala_error("CREATE TABLE refactor", create_refactor_result))
-            temp_tables.append(refactor_table)
-
-            log_info("Descubriendo columnas via DESCRIBE para tablas temporales")
-            cols_a = run_describe(original_table, args.impala_shell, args.impala_opts)
-            cols_b = run_describe(refactor_table, args.impala_shell, args.impala_opts)
-            common_cols = shared_columns(cols_a, cols_b)
-            if not common_cols:
-                raise ValueError(
-                    "El par {0} no tiene columnas en comun entre {1} y {2}.".format(
-                        pair_name, original_table, refactor_table
+                metrics_rows.append(
+                    build_step_metrics(
+                        "create_original_temp_table",
+                        create_original_result,
+                        impala_web_url,
+                        args.elastic_timeout,
+                        allow_api=False,
                     )
                 )
+                if create_original_result["returncode"] != 0:
+                    raise RuntimeError(format_impala_error("CREATE TABLE original", create_original_result))
+                temp_tables.append(original_table)
 
-            if args.auto_columns and not key_columns:
-                key_columns = choose_auto_key_columns(common_cols)
-
-            if not key_columns:
-                raise ValueError(
-                    "El par {0} no tiene key_columns. Usa --key-columns o --auto-columns.".format(pair_name)
+                create_refactor_sql = "CREATE TABLE {0} AS {1}".format(refactor_table, refactor_query)
+                create_refactor_result = run_impala_query_timed(
+                    create_refactor_sql,
+                    args.impala_shell,
+                    args.impala_opts,
+                    show_profiles=True,
+                    step_name="create_refactor_temp_table",
                 )
+                metrics_rows.append(
+                    build_step_metrics(
+                        "create_refactor_temp_table",
+                        create_refactor_result,
+                        impala_web_url,
+                        args.elastic_timeout,
+                        allow_api=False,
+                    )
+                )
+                if create_refactor_result["returncode"] != 0:
+                    raise RuntimeError(format_impala_error("CREATE TABLE refactor", create_refactor_result))
+                temp_tables.append(refactor_table)
 
-            rows = [(pair_name, original_table, refactor_table, key_columns, common_cols)]
+                log_info("Descubriendo columnas via DESCRIBE para tablas temporales")
+                cols_a = run_describe(original_table, args.impala_shell, args.impala_opts)
+                cols_b = run_describe(refactor_table, args.impala_shell, args.impala_opts)
+                common_cols = shared_columns(cols_a, cols_b)
+                if not common_cols:
+                    raise ValueError(
+                        "El par {0} no tiene columnas en comun entre {1} y {2}.".format(
+                            pair_name, original_table, refactor_table
+                        )
+                    )
+
+                if args.auto_columns and not key_columns:
+                    key_columns = choose_auto_key_columns(common_cols)
+
+                if not key_columns:
+                    raise ValueError(
+                        "El par {0} no tiene key_columns. Usa --key-columns o --auto-columns.".format(pair_name)
+                    )
+
+                rows = [(pair_name, original_table, refactor_table, key_columns, common_cols)]
         else:
             log_info("Iniciando modo pairs con CSV: {0}".format(args.pairs))
             rows = build_rows_from_pairs_csv(args)
 
-        sql_parts = [
-            "-- SQL generado automaticamente para validacion funcional",
-            "-- Metricas: count, anti-join por clave, hash y comparacion estricta por fila completa con multiplicidad.",
-            "-- Nota: para hash y validacion estricta se usan las columnas en comun detectadas por DESCRIBE.",
-            "",
-        ]
+        if not args.skip_step1:
+            sql_parts = [
+                "-- SQL generado automaticamente para validacion funcional",
+                "-- Metricas: count, anti-join por clave, hash y comparacion estricta por fila completa con multiplicidad.",
+                "-- Nota: para hash y validacion estricta se usan las columnas en comun detectadas por DESCRIBE.",
+                "",
+            ]
 
-        for row_data in rows:
-            sql_parts.append(
-                metric_block(
-                    row_data[0],
-                    row_data[1],
-                    row_data[2],
-                    row_data[3],
-                    row_data[4],
-                    sample_size=DEFAULT_SAMPLE_SIZE,
+            for row_data in rows:
+                sql_parts.append(
+                    metric_block(
+                        row_data[0],
+                        row_data[1],
+                        row_data[2],
+                        row_data[3],
+                        row_data[4],
+                        sample_size=DEFAULT_SAMPLE_SIZE,
+                    )
                 )
-            )
 
-        ensure_parent_dir(output_path)
-        write_text_file(output_path, "\n".join(sql_parts))
-        log_info("SQL generado en {0}".format(output_path))
+            ensure_parent_dir(output_path)
+            write_text_file(output_path, "\n".join(sql_parts))
+            log_info("SQL generado en {0}".format(output_path))
 
         if execute_generated_sql:
             log_info("Ejecutando SQL de comparacion en Impala")
@@ -2055,114 +2264,15 @@ def main():
             if step1_summary.get("all_pass"):
                 log_info("STEP 1 PASS: STRICT_100_RESULT=OK para todos los pares")
                 if use_sql_mode:
-                    run_total = int(args.step2_runs)
-                    elastic_config = resolve_elastic_config(args.elastic_env_file, args.elastic_index)
-                    log_info(
-                        "STEP 2 START: ejecucion read-only directa, {0} runs por query, orden alternado; metricas via Elasticsearch.".format(
-                            run_total
-                        )
+                    step2_summary, step2_error = run_step2_sql_mode(
+                        original_query,
+                        refactor_query,
+                        args,
+                        metrics_rows,
+                        impala_web_url,
                     )
-
-                    original_run_metrics = []
-                    refactor_run_metrics = []
-                    step2_run_metrics = []
-
-                    for run_idx in range(run_total):
-                        run_number = run_idx + 1
-                        if run_idx % 2 == 0:
-                            run_plan = [("original", original_query), ("refactor", refactor_query)]
-                        else:
-                            run_plan = [("refactor", refactor_query), ("original", original_query)]
-
-                        log_info(
-                            "STEP 2 ROUND {0}/{1}: orden={2}->{3}".format(
-                                run_number,
-                                run_total,
-                                run_plan[0][0],
-                                run_plan[1][0],
-                            )
-                        )
-
-                        for round_order, plan_item in enumerate(run_plan, 1):
-                            side = plan_item[0]
-                            query_text = plan_item[1]
-                            step_name = "step2_readonly_{0}_run{1}".format(side, run_number)
-
-                            run_result = run_impala_query_timed(
-                                query_text,
-                                args.impala_shell,
-                                args.impala_opts,
-                                show_profiles=True,
-                                step_name=step_name,
-                                delimited=True,
-                            )
-                            run_metric = build_step_metrics(
-                                step_name,
-                                run_result,
-                                impala_web_url,
-                                args.elastic_timeout,
-                                allow_api=False,
-                            )
-                            run_metric["query_side"] = side
-                            run_metric["run_index"] = run_number
-                            run_metric["round_order"] = round_order
-                            metrics_rows.append(run_metric)
-                            step2_run_metrics.append(run_metric)
-
-                            if side == "original":
-                                original_run_metrics.append(run_metric)
-                            else:
-                                refactor_run_metrics.append(run_metric)
-
-                            if run_result["returncode"] != 0:
-                                step2_summary = {
-                                    "status": "ERROR",
-                                    "reason": "Fallo Step 2 en run {0} lado {1}".format(run_number, side),
-                                    "method": "direct_query_elastic_lookup",
-                                    "policy": "alternating",
-                                    "runs": run_total,
-                                    "original_metrics": aggregate_step2_side_metrics(original_run_metrics),
-                                    "refactor_metrics": aggregate_step2_side_metrics(refactor_run_metrics),
-                                    "original_runs": original_run_metrics,
-                                    "refactor_runs": refactor_run_metrics,
-                                    "original_rowcount": "",
-                                    "refactor_rowcount": "",
-                                }
-                                raise RuntimeError(format_impala_error(step_name, run_result))
-
-                    try:
-                        enrich_step2_metrics_from_elastic(
-                            step2_run_metrics,
-                            elastic_config,
-                            args.elastic_wait_sec,
-                            args.elastic_timeout,
-                        )
-                        log_info("STEP 2 METRICS: enriquecimiento Elasticsearch completado")
-                    except Exception as exc:
-                        log_warn("STEP 2 METRICS: lookup Elasticsearch fallo, se usa fallback wall-clock ({0})".format(exc))
-                        for run_metric in step2_run_metrics:
-                            run_metric["duration_ms"] = wall_clock_ms_from_metric(run_metric)
-                            run_metric["api_duration_ms"] = run_metric["duration_ms"]
-                            run_metric["cpu_total"] = None
-                            run_metric["memory_total_bytes"] = None
-                            run_metric["peak_memory_bytes"] = None
-                            run_metric["metric_source"] = "wall_clock_backup"
-                            append_metric_warning(run_metric, "elastic_lookup_error:{0}".format(exc))
-
-                    step2_summary = {
-                        "status": "COMPLETED",
-                        "reason": "",
-                        "method": "direct_query_elastic_lookup",
-                        "policy": "alternating",
-                        "runs": run_total,
-                        "original_metrics": aggregate_step2_side_metrics(original_run_metrics),
-                        "refactor_metrics": aggregate_step2_side_metrics(refactor_run_metrics),
-                        "original_runs": original_run_metrics,
-                        "refactor_runs": refactor_run_metrics,
-                        "original_rowcount": "",
-                        "refactor_rowcount": "",
-                    }
-                    log_info("STEP 2 COMPLETED: comparacion read-only multi-run finalizada")
+                    if step2_error:
+                        raise RuntimeError(step2_error)
                 else:
                     step2_summary["status"] = "SKIPPED"
                     step2_summary["reason"] = "Step 2 read-only solo aplica para modo sql"
@@ -2173,26 +2283,44 @@ def main():
                 step2_summary["reason"] = "Step 1 FAIL: se omite Step 2"
                 log_warn("STEP 1 FAIL: se omite Step 2")
         else:
-            log_info("SQL no ejecutado (usa --run)")
-            step1_summary = {
-                "status": "SKIPPED",
-                "all_pass": False,
-                "pairs": [],
-                "reason": "No se ejecuto SQL de comparacion",
-            }
-            step2_summary = {
-                "status": "SKIPPED",
-                "reason": "Step 2 requiere que Step 1 se ejecute",
-                "method": "direct_query_elastic_lookup",
-                "policy": "alternating",
-                "runs": args.step2_runs,
-                "original_metrics": None,
-                "refactor_metrics": None,
-                "original_runs": [],
-                "refactor_runs": [],
-                "original_rowcount": "",
-                "refactor_rowcount": "",
-            }
+            if args.skip_step1 and use_sql_mode:
+                log_info("STEP 1 SKIPPED: se ejecuta Step 2 directamente")
+                step1_summary = {
+                    "status": "SKIPPED",
+                    "all_pass": False,
+                    "pairs": [],
+                    "reason": "Step 1 omitido por --skip-step1",
+                }
+                step2_summary, step2_error = run_step2_sql_mode(
+                    original_query,
+                    refactor_query,
+                    args,
+                    metrics_rows,
+                    impala_web_url,
+                )
+                if step2_error:
+                    raise RuntimeError(step2_error)
+            else:
+                log_info("SQL no ejecutado (usa --run)")
+                step1_summary = {
+                    "status": "SKIPPED",
+                    "all_pass": False,
+                    "pairs": [],
+                    "reason": "No se ejecuto SQL de comparacion",
+                }
+                step2_summary = {
+                    "status": "SKIPPED",
+                    "reason": "Step 2 requiere que Step 1 se ejecute",
+                    "method": "direct_query_elastic_lookup",
+                    "policy": "alternating",
+                    "runs": args.step2_runs,
+                    "original_metrics": None,
+                    "refactor_metrics": None,
+                    "original_runs": [],
+                    "refactor_runs": [],
+                    "original_rowcount": "",
+                    "refactor_rowcount": "",
+                }
     finally:
         if use_sql_mode and temp_tables:
             log_info("Iniciando cleanup de tablas temporales")
