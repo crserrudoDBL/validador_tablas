@@ -2038,6 +2038,11 @@ def main():
         action="store_true",
         help="Omite Step 1 y ejecuta directamente Step 2 (solo modo sql).",
     )
+    parser.add_argument(
+        "--skip-step2",
+        action="store_true",
+        help="Omite Step 2 y solo ejecuta la validacion (Step 1).",
+    )
     parser.set_defaults(auto_columns=True)
     args = parser.parse_args()
 
@@ -2069,6 +2074,8 @@ def main():
 
     if args.skip_step1 and not use_sql_mode:
         raise ValueError("--skip-step1 solo se permite en modo sql con --original-sql y --refactor-sql.")
+    if args.skip_step1 and args.skip_step2:
+        raise ValueError("No puedes especificar --skip-step1 y --skip-step2 al mismo tiempo.")
 
     log_info("Modo de ejecucion seleccionado: {0}".format("sql" if use_sql_mode else "pairs"))
 
@@ -2264,15 +2271,20 @@ def main():
             if step1_summary.get("all_pass"):
                 log_info("STEP 1 PASS: STRICT_100_RESULT=OK para todos los pares")
                 if use_sql_mode:
-                    step2_summary, step2_error = run_step2_sql_mode(
-                        original_query,
-                        refactor_query,
-                        args,
-                        metrics_rows,
-                        impala_web_url,
-                    )
-                    if step2_error:
-                        raise RuntimeError(step2_error)
+                    if args.skip_step2:
+                        step2_summary["status"] = "SKIPPED"
+                        step2_summary["reason"] = "Step 2 omitido por parametro --skip-step2"
+                        log_info("STEP 2 SKIPPED: omitido por parametro --skip-step2")
+                    else:
+                        step2_summary, step2_error = run_step2_sql_mode(
+                            original_query,
+                            refactor_query,
+                            args,
+                            metrics_rows,
+                            impala_web_url,
+                        )
+                        if step2_error:
+                            raise RuntimeError(step2_error)
                 else:
                     step2_summary["status"] = "SKIPPED"
                     step2_summary["reason"] = "Step 2 read-only solo aplica para modo sql"
