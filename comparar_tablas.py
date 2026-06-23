@@ -56,13 +56,20 @@ def decode_if_bytes(value):
 def to_text(value):
     value = decode_if_bytes(value)
     if value is None:
-        return ""
+        return u""
     if isinstance(value, text_type):
         return value
+    if isinstance(value, Exception):
+        if hasattr(value, "args") and value.args:
+            return u" ".join(to_text(arg) for arg in value.args)
+        return text_type(repr(value))
     try:
         return text_type(value)
     except Exception:
-        return text_type(str(value))
+        try:
+            return text_type(repr(value))
+        except Exception:
+            return u"unrepresentable_value"
 
 
 def write_stderr_line(message):
@@ -157,14 +164,21 @@ def run_command_timed(cmd, step_name=""):
     label = step_name or "command"
     log_info("START {0}: {1}".format(label, preview_command(cmd)))
 
+    safe_cmd = []
+    for c in cmd:
+        if sys.version_info[0] < 3 and isinstance(c, text_type):
+            safe_cmd.append(c.encode("utf-8"))
+        else:
+            safe_cmd.append(c)
+
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(safe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as exc:
         raise RuntimeError(
             "No se pudo ejecutar el comando del sistema. "
             "Verifica que impala-shell exista y sea ejecutable.\n"
             "Comando: {0}\n"
-            "Detalle: {1}".format(" ".join(cmd), exc)
+            "Detalle: {1}".format(preview_command(cmd), exc)
         )
 
     out, err = proc.communicate()
@@ -1076,17 +1090,17 @@ def make_temp_table_name(temp_db, temp_prefix, pair_name, role):
 def format_impala_error(action_label, result):
     stderr = (result.get("stderr") or "").strip()
     stdout = (result.get("stdout") or "").strip()
-    cmd = " ".join(result.get("cmd") or [])
+    cmd = preview_command(result.get("cmd") or [])
 
     lines = [
-        "ERROR en {0} (exit code {1}).".format(action_label, result.get("returncode")),
-        "Comando: {0}".format(cmd),
+        u"ERROR en {0} (exit code {1}).".format(action_label, result.get("returncode")),
+        u"Comando: {0}".format(preview_command(cmd)),
     ]
     if stderr:
-        lines.append("STDERR: {0}".format(stderr))
+        lines.append(u"STDERR: {0}".format(stderr))
     if stdout:
-        lines.append("STDOUT: {0}".format(stdout[:2000]))
-    return "\n".join(lines)
+        lines.append(u"STDOUT: {0}".format(stdout[:2000]))
+    return u"\n".join(lines)
 
 
 def build_step_metrics(step_name, result, impala_web_url=None, web_timeout_sec=None, allow_api=False):
@@ -1315,6 +1329,16 @@ def render_side_by_side_samples(pair_samples, sample_limit):
 
         lines.append("  {0:<{w}} | {1:<{w}}".format(left_text, right_text, w=col_width))
 
+    lines.append("")
+    lines.append("  Muestras completas sin truncar (primeras 2):")
+    for idx in range(min(2, row_total)):
+        lines.append("  --- Muestra {0} ---".format(idx + 1))
+        if idx < len(a_samples):
+            lines.append("    ORIGINAL: {0}".format(to_text(a_samples[idx].get("row", ""))))
+        if idx < len(b_samples):
+            lines.append("    REFACTOR: {0}".format(to_text(b_samples[idx].get("row", ""))))
+        lines.append("")
+
     return lines
 
 
@@ -1446,11 +1470,14 @@ def aggregate_step2_side_metrics(run_metrics):
     return aggregated
 
 
-def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_summary, sample_limit):
+def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_summary, sample_limit, original_sql_file="", refactor_sql_file=""):
     lines = []
     lines.append("VALIDADOR DE QUERIES - REPORTE HUMANO")
     lines.append("Generado: {0}".format(now_utc_iso()))
     lines.append("Modo: {0}".format(mode_name))
+    if original_sql_file or refactor_sql_file:
+        lines.append("Archivo Original: {0}".format(original_sql_file or "N/A"))
+        lines.append("Archivo Refactor: {0}".format(refactor_sql_file or "N/A"))
     lines.append("")
 
     lines.append("STEP 1 - EQUIVALENCIA FUNCIONAL (regla: STRICT_100_RESULT = OK)")
@@ -2080,7 +2107,12 @@ def main():
     log_info("Modo de ejecucion seleccionado: {0}".format("sql" if use_sql_mode else "pairs"))
 
     output_path = args.output
-    report_path = (args.human_report or "").strip() or DEFAULT_HUMAN_REPORT_PATH
+    report_path = (args.human_report or "").strip()
+    if not report_path:
+        if use_sql_mode:
+            report_path = "comparison_report_{0}.txt".format(args.pair_name.strip() or "sql_file_pair")
+        else:
+            report_path = DEFAULT_HUMAN_REPORT_PATH
     temp_tables = []
     metrics_rows = []
     rows = []
@@ -2139,7 +2171,7 @@ def main():
                 log_info("Tabla temporal original: {0}".format(original_table))
                 log_info("Tabla temporal refactor: {0}".format(refactor_table))
 
-                create_original_sql = "CREATE TABLE {0} AS {1}".format(original_table, original_query)
+                create_original_sql = u"CREATE TABLE {0} AS {1}".format(original_table, original_query)
                 create_original_result = run_impala_query_timed(
                     create_original_sql,
                     args.impala_shell,
@@ -2160,7 +2192,7 @@ def main():
                     raise RuntimeError(format_impala_error("CREATE TABLE original", create_original_result))
                 temp_tables.append(original_table)
 
-                create_refactor_sql = "CREATE TABLE {0} AS {1}".format(refactor_table, refactor_query)
+                create_refactor_sql = u"CREATE TABLE {0} AS {1}".format(refactor_table, refactor_query)
                 create_refactor_result = run_impala_query_timed(
                     create_refactor_sql,
                     args.impala_shell,
@@ -2381,6 +2413,8 @@ def main():
                 comparison_samples_by_pair,
                 step2_summary,
                 DEFAULT_SAMPLE_SIZE,
+                original_sql_file=args.original_sql if use_sql_mode else "",
+                refactor_sql_file=args.refactor_sql if use_sql_mode else "",
             )
             ensure_parent_dir(report_path)
             write_text_file(report_path, report_text)
@@ -2392,7 +2426,8 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
-        write_stderr_line(exc)
+    except Exception:
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
