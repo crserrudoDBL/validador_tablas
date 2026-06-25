@@ -29,7 +29,7 @@ except ImportError:
 
 
 QUERY_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16}:[0-9a-fA-F]{16})")
-DEFAULT_SAMPLE_SIZE = 50
+DEFAULT_SAMPLE_SIZE = 3
 DEFAULT_STEP2_RUNS = 5
 DEFAULT_HUMAN_REPORT_PATH = "comparison_report.txt"
 DEFAULT_ELASTIC_INDEX = "impala-metricas-queries"
@@ -293,10 +293,13 @@ def open_csv_reader(path):
     return open(path, "r", encoding="utf-8", newline="")
 
 
-def write_text_file(path, text):
-    text = decode_if_bytes(text)
-    with io.open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+def write_text_file(path, text, append=False):
+    ensure_parent_dir(path)
+    mode = "a" if append else "w"
+    with io.open(path, mode, encoding="utf-8") as f:
+        if append:
+            f.write(u"\n\n" + u"="*100 + u"\n\n")
+        f.write(to_text(text))
 
 
 def normalize_col_name(col):
@@ -1290,54 +1293,106 @@ def truncate_text(value, max_len):
     return text[: max_len - 3] + "..."
 
 
-def render_side_by_side_samples(pair_samples, sample_limit):
+def render_side_by_side_samples(pair_samples, sample_limit, pair_meta=None):
     a_samples = (pair_samples or {}).get("A_ONLY", [])[:sample_limit]
     b_samples = (pair_samples or {}).get("B_ONLY", [])[:sample_limit]
 
     lines = []
     if not a_samples and not b_samples:
-        lines.append("  No se encontraron muestras de diferencias para mostrar.")
+        lines.append(u"  No se encontraron muestras de diferencias para mostrar.")
         return lines
 
-    col_width = 72
-    lines.append("  Muestras lado a lado (hasta {0} por lado):".format(sample_limit))
-    lines.append(
-        "  {0:<{w}} | {1:<{w}}".format(
-            "ORIGINAL (A_ONLY)",
-            "REFACTOR (B_ONLY)",
-            w=col_width,
-        )
-    )
-    lines.append("  " + ("-" * col_width) + "-+-" + ("-" * col_width))
+    pair_meta = pair_meta or {}
+    common_cols = pair_meta.get("common_cols", [])
+    key_columns = pair_meta.get("key_columns", [])
+    types_a = pair_meta.get("types_a", {})
+    types_b = pair_meta.get("types_b", {})
 
-    row_total = max(len(a_samples), len(b_samples))
-    for idx in range(row_total):
-        left_text = ""
-        right_text = ""
+    lines.append(u"")
+    lines.append(u"  Detalle de Diferencias (hasta {0} muestras):".format(sample_limit))
+    
+    b_dict = {}
+    for b in b_samples:
+        b_dict.setdefault(b["key"], []).append(b)
 
-        if idx < len(a_samples):
-            left_sample = a_samples[idx]
-            left_key = truncate_text(left_sample.get("key", ""), 28)
-            left_row = truncate_text(left_sample.get("row", ""), col_width - 37)
-            left_text = "KEY={0} ROW={1}".format(left_key, left_row)
+    diff_lines = []
+    printed_samples_a = 0
+    any_match_found = False
+    
+    for a in a_samples:
+        if printed_samples_a >= sample_limit: break
+        key = a["key"]
+        
+        diff_lines.append(u"  --- Muestra A-{0} (Key: {1}) ---".format(printed_samples_a + 1, key))
+        
+        b_match = None
+        fallback_matched = False
+        if key in b_dict and b_dict[key]:
+            b_match = b_dict[key].pop(0)
 
-        if idx < len(b_samples):
-            right_sample = b_samples[idx]
-            right_key = truncate_text(right_sample.get("key", ""), 28)
-            right_row = truncate_text(right_sample.get("row", ""), col_width - 37)
-            right_text = "KEY={0} ROW={1}".format(right_key, right_row)
+        a_vals = a["row"].split("|||")
+        if not b_match:
+            for b_key, b_list in b_dict.items():
+                for b_idx, possible_b in enumerate(b_list):
+                    possible_b_vals = possible_b["row"].split("|||")
+                    data_matches = True
+                    for i, col in enumerate(common_cols):
+                        if col not in key_columns:
+                            val_a = a_vals[i] if i < len(a_vals) else ""
+                            val_b = possible_b_vals[i] if i < len(possible_b_vals) else ""
+                            if val_a != val_b:
+                                data_matches = False
+                                break
+                    if data_matches:
+                        b_match = b_list.pop(b_idx)
+                        fallback_matched = True
+                        any_match_found = True
+                        break
+                if b_match:
+                    break
 
-        lines.append("  {0:<{w}} | {1:<{w}}".format(left_text, right_text, w=col_width))
+        if b_match:
+            any_match_found = True
+            b_vals = b_match["row"].split("|||")
+            diff_found = False
+            if fallback_matched:
+                diff_lines.append(u"    [DIFERENCIAS ENCONTRADAS - CLAVES DISTINTAS, DATOS IDENTICOS]")
+            else:
+                diff_lines.append(u"    [DIFERENCIAS ENCONTRADAS]")
+                
+            for i, col in enumerate(common_cols):
+                val_a = a_vals[i] if i < len(a_vals) else ""
+                val_b = b_vals[i] if i < len(b_vals) else ""
+                if val_a != val_b:
+                    diff_found = True
+                    type_a = types_a.get(col, "unknown")
+                    type_b = types_b.get(col, "unknown")
+                    diff_lines.append(u"      {0}: ORIGINAL='{1}' ({2}) | REFACTOR='{3}' ({4})".format(col, val_a, type_a, val_b, type_b))
+            if not diff_found and not fallback_matched:
+                diff_lines.append(u"      (No se encontraron diferencias en los valores. Diferencia en multiplicidad)")
+        else:
+            diff_lines.append(u"    (Fila presente en ORIGINAL pero no en REFACTOR)")
+                
+        diff_lines.append(u"")
+        printed_samples_a += 1
 
-    lines.append("")
-    lines.append("  Muestras completas sin truncar (primeras 2):")
-    for idx in range(min(2, row_total)):
-        lines.append("  --- Muestra {0} ---".format(idx + 1))
-        if idx < len(a_samples):
-            lines.append("    ORIGINAL: {0}".format(to_text(a_samples[idx].get("row", ""))))
-        if idx < len(b_samples):
-            lines.append("    REFACTOR: {0}".format(to_text(b_samples[idx].get("row", ""))))
-        lines.append("")
+    printed_samples_b = 0
+    for b in b_samples:
+        if printed_samples_b >= sample_limit: break
+        if b["key"] in b_dict and b in b_dict[b["key"]]:
+            key = b["key"]
+            diff_lines.append(u"  --- Muestra B-{0} (Key: {1}) ---".format(printed_samples_b + 1, key))
+            diff_lines.append(u"    (Fila presente en REFACTOR pero no en ORIGINAL)")
+                
+            diff_lines.append(u"")
+            printed_samples_b += 1
+
+    if not any_match_found and (a_samples or b_samples):
+        diff_lines.append(u"  [!] NOTA: No se pudo emparejar ninguna fila por clave ni por resto de campos entre las muestras extraidas.")
+        diff_lines.append(u"            (Esto significa que, para estas muestras, las filas originales y del refactor difieren completamente).")
+        diff_lines.append(u"")
+
+    lines.extend(diff_lines)
 
     return lines
 
@@ -1470,133 +1525,138 @@ def aggregate_step2_side_metrics(run_metrics):
     return aggregated
 
 
-def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_summary, sample_limit, original_sql_file="", refactor_sql_file=""):
+def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_summary, sample_limit, original_sql_file="", refactor_sql_file="", pairs_metadata=None):
     lines = []
-    lines.append("VALIDADOR DE QUERIES - REPORTE HUMANO")
-    lines.append("Generado: {0}".format(now_utc_iso()))
-    lines.append("Modo: {0}".format(mode_name))
+    lines.append(u"VALIDADOR DE QUERIES - REPORTE HUMANO")
+    lines.append(u"Generado: {0}".format(now_utc_iso()))
+    lines.append(u"Modo: {0}".format(mode_name))
     if original_sql_file or refactor_sql_file:
-        lines.append("Archivo Original: {0}".format(original_sql_file or "N/A"))
-        lines.append("Archivo Refactor: {0}".format(refactor_sql_file or "N/A"))
-    lines.append("")
+        lines.append(u"Archivo Original: {0}".format(original_sql_file or "N/A"))
+        lines.append(u"Archivo Refactor: {0}".format(refactor_sql_file or "N/A"))
+    lines.append(u"")
 
-    lines.append("STEP 1 - EQUIVALENCIA FUNCIONAL (regla: STRICT_100_RESULT = OK)")
-    lines.append("=" * 100)
+    lines.append(u"STEP 1 - EQUIVALENCIA FUNCIONAL (regla: STRICT_100_RESULT = OK)")
+    lines.append(u"=" * 100)
 
     step1_pairs = step1_summary.get("pairs", [])
     if not step1_pairs:
-        lines.append("No se pudieron obtener metricas de comparacion para Step 1.")
+        lines.append(u"No se pudieron obtener metricas de comparacion para Step 1.")
     else:
         for pair_result in step1_pairs:
             pair_name = pair_result.get("pair_name", "(sin_nombre)")
             metrics = pair_result.get("metrics") or {}
+            pair_meta = (pairs_metadata or {}).get(pair_name, {})
 
-            lines.append("Par: {0}".format(pair_name))
-            lines.append("  Resultado: {0}".format(pair_result.get("status", "FAIL")))
-            lines.append("  Razon: {0}".format(pair_result.get("reason", "n/a")))
-            lines.append("  FAST_AUDIT_RESULT: {0}".format(pair_result.get("fast_result", "NO_DATA")))
-            lines.append("  STRICT_100_RESULT: {0}".format(pair_result.get("strict_result", "NO_DATA")))
-            lines.append(
-                "  A_total={0} | B_total={1} | A_minus_B_fullrow={2} | B_minus_A_fullrow={3}".format(
-                    metrics.get("A_total", "n/a"),
-                    metrics.get("B_total", "n/a"),
-                    metrics.get("A_minus_B_fullrow", "n/a"),
-                    metrics.get("B_minus_A_fullrow", "n/a"),
-                )
-            )
+            lines.append(u"Par: {0}".format(pair_name))
+            key_cols = pair_meta.get("key_columns") or []
+            lines.append(u"  Key Columns: {0}".format(", ".join(key_cols) if key_cols else "N/A"))
+            lines.append(u"  Resultado: {0}".format(pair_result.get("status", "FAIL")))
+            lines.append(u"  Razon: {0}".format(pair_result.get("reason", "n/a")))
+            lines.append(u"  FAST_AUDIT_RESULT: {0} (Comprobacion rapida de totales, hashes y claves)".format(pair_result.get("fast_result", "NO_DATA")))
+            lines.append(u"  STRICT_100_RESULT: {0} (Comprobacion estricta fila por fila, incluyendo multiplicidad)".format(pair_result.get("strict_result", "NO_DATA")))
+            lines.append(u"  A_total={0} (Total filas Original) | B_total={1} (Total filas Refactor)".format(
+                metrics.get("A_total", "n/a"),
+                metrics.get("B_total", "n/a"),
+            ))
+            lines.append(u"  A_minus_B_fullrow={0} (Filas en Original que NO estan en Refactor o difieren en multiplicidad/datos)".format(
+                metrics.get("A_minus_B_fullrow", "n/a")
+            ))
+            lines.append(u"  B_minus_A_fullrow={0} (Filas en Refactor que NO estan en Original o difieren en multiplicidad/datos)".format(
+                metrics.get("B_minus_A_fullrow", "n/a")
+            ))
 
             if pair_result.get("status") != "PASS":
                 pair_samples = samples_by_pair.get(pair_name, {"A_ONLY": [], "B_ONLY": []})
-                lines.extend(render_side_by_side_samples(pair_samples, sample_limit))
+                lines.extend(render_side_by_side_samples(pair_samples, sample_limit, pair_meta))
 
-            lines.append("")
+            lines.append(u"")
 
-    lines.append("Resultado global Step 1: {0}".format(step1_summary.get("status", "FAIL")))
-    lines.append("")
+    lines.append(u"Resultado global Step 1: {0}".format(step1_summary.get("status", "FAIL")))
+    lines.append(u"")
 
-    lines.append("STEP 2 - EFICIENCIA (read-only re-ejecucion de queries)")
-    lines.append("=" * 100)
+    lines.append(u"STEP 2 - EFICIENCIA (read-only re-ejecucion de queries)")
+    lines.append(u"=" * 100)
     step2_status = step2_summary.get("status", "SKIPPED")
-    lines.append("Estado: {0}".format(step2_status))
+    lines.append(u"Estado: {0}".format(step2_status))
 
     if step2_status != "COMPLETED":
-        lines.append("Motivo: {0}".format(step2_summary.get("reason", "n/a")))
-        return "\n".join(lines)
+        lines.append(u"Motivo: {0}".format(step2_summary.get("reason", "n/a")))
+        return u"\n".join(lines)
 
-    lines.append("Metodo: ejecucion directa de cada query en modo read-only + lookup diferido en Elasticsearch.")
+    lines.append(u"Metodo: ejecucion directa de cada query en modo read-only + lookup diferido en Elasticsearch.")
     lines.append(
-        "Politica: {0} | runs por query: {1}".format(
+        u"Politica: {0} | runs por query: {1}".format(
             step2_summary.get("policy", "n/a"),
             step2_summary.get("runs", "n/a"),
         )
     )
     if step2_summary.get("original_rowcount") or step2_summary.get("refactor_rowcount"):
-        lines.append("Rowcount original: {0}".format(step2_summary.get("original_rowcount") or "n/a"))
-        lines.append("Rowcount refactor: {0}".format(step2_summary.get("refactor_rowcount") or "n/a"))
+        lines.append(u"Rowcount original: {0}".format(step2_summary.get("original_rowcount") or "n/a"))
+        lines.append(u"Rowcount refactor: {0}".format(step2_summary.get("refactor_rowcount") or "n/a"))
 
     original_metrics = step2_summary.get("original_metrics") or {}
     refactor_metrics = step2_summary.get("refactor_metrics") or {}
     original_runs = step2_summary.get("original_runs") or []
     refactor_runs = step2_summary.get("refactor_runs") or []
 
-    lines.append("Fuente metricas original: {0}".format(original_metrics.get("metric_source", "n/a")))
-    lines.append("Fuente metricas refactor: {0}".format(refactor_metrics.get("metric_source", "n/a")))
-    lines.append("")
+    lines.append(u"Fuente metricas original: {0}".format(original_metrics.get("metric_source", "n/a")))
+    lines.append(u"Fuente metricas refactor: {0}".format(refactor_metrics.get("metric_source", "n/a")))
+    lines.append(u"")
 
     lines.append(
-        "Series tiempo original: {0}".format(
+        u"Series tiempo original: {0}".format(
             format_run_metric_series(
                 original_runs,
                 "duration_ms",
-                lambda v: "n/a" if v is None else "{0:.2f}ms".format(v),
+                lambda v: "n/a" if v is None else u"{0:.2f}ms".format(v),
             )
         )
     )
     lines.append(
-        "Series tiempo refactor: {0}".format(
+        u"Series tiempo refactor: {0}".format(
             format_run_metric_series(
                 refactor_runs,
                 "duration_ms",
-                lambda v: "n/a" if v is None else "{0:.2f}ms".format(v),
+                lambda v: "n/a" if v is None else u"{0:.2f}ms".format(v),
             )
         )
     )
-    lines.append("")
-    lines.append("Comparacion por mediana:")
+    lines.append(u"")
+    lines.append(u"Comparacion por mediana:")
 
     lines.append(
         format_efficiency_line(
-            "Tiempo query duration_ms [n_orig={0}, n_ref={1}]".format(
+            u"Tiempo query duration_ms [n_orig={0}, n_ref={1}]".format(
                 original_metrics.get("duration_ms_sample_count", 0),
                 refactor_metrics.get("duration_ms_sample_count", 0),
             ),
             original_metrics.get("duration_ms"),
             refactor_metrics.get("duration_ms"),
-            lambda v: "n/a" if v is None else "{0:.2f}ms".format(v),
+            lambda v: "n/a" if v is None else u"{0:.2f}ms".format(v),
             lower_is_better=True,
         )
     )
     lines.append(
         format_efficiency_line(
-            "Memoria total host-sum [n_orig={0}, n_ref={1}]".format(
+            u"Memoria total host-sum [n_orig={0}, n_ref={1}]".format(
                 original_metrics.get("memory_total_bytes_sample_count", 0),
                 refactor_metrics.get("memory_total_bytes_sample_count", 0),
             ),
             original_metrics.get("memory_total_bytes"),
             refactor_metrics.get("memory_total_bytes"),
-            lambda v: "n/a" if v is None else "{0:.2f}MB".format(v / (1024.0 * 1024.0)),
+            lambda v: "n/a" if v is None else u"{0:.2f}MB".format(v / (1024.0 * 1024.0)),
             lower_is_better=True,
         )
     )
     lines.append(
         format_efficiency_line(
-            "CPU total host-sum [n_orig={0}, n_ref={1}]".format(
+            u"CPU total host-sum [n_orig={0}, n_ref={1}]".format(
                 original_metrics.get("cpu_total_sample_count", 0),
                 refactor_metrics.get("cpu_total_sample_count", 0),
             ),
             original_metrics.get("cpu_total"),
             refactor_metrics.get("cpu_total"),
-            lambda v: "n/a" if v is None else "{0:.3f}".format(v),
+            lambda v: "n/a" if v is None else u"{0:.3f}".format(v),
             lower_is_better=True,
         )
     )
@@ -1605,12 +1665,11 @@ def build_human_report_text(mode_name, step1_summary, samples_by_pair, step2_sum
     warnings.extend(original_metrics.get("metric_warnings") or [])
     warnings.extend(refactor_metrics.get("metric_warnings") or [])
     if warnings:
-        lines.append("")
-        lines.append("Advertencias de metricas:")
+        lines.append(u"Advertencias de metricas:")
         for warning in warnings:
-            lines.append("- {0}".format(warning))
+            lines.append(u"- {0}".format(warning))
 
-    return "\n".join(lines)
+    return u"\n".join(lines)
 
 
 def build_rows_from_pairs_csv(args):
@@ -1632,8 +1691,8 @@ def build_rows_from_pairs_csv(args):
             if not pair_name or not original_table or not refactor_table:
                 raise ValueError("Cada fila debe tener pair_name, original_table y refactor_table.")
 
-            cols_a = run_describe(original_table, args.impala_shell, args.impala_opts)
-            cols_b = run_describe(refactor_table, args.impala_shell, args.impala_opts)
+            cols_a, types_a = run_describe(original_table, args.impala_shell, args.impala_opts)
+            cols_b, types_b = run_describe(refactor_table, args.impala_shell, args.impala_opts)
             common_cols = shared_columns(cols_a, cols_b)
             if not common_cols:
                 raise ValueError(
@@ -1650,7 +1709,8 @@ def build_rows_from_pairs_csv(args):
                     "El par {0} no tiene key_columns. Cargalas en el CSV o usa --auto-columns.".format(pair_name)
                 )
 
-            rows.append((pair_name, original_table, refactor_table, key_columns, common_cols))
+            metadata = {"types_a": types_a, "types_b": types_b, "common_cols": common_cols, "key_columns": key_columns}
+            rows.append((pair_name, original_table, refactor_table, key_columns, common_cols, metadata))
 
             log_info("Total de pares cargados: {0}".format(len(rows)))
 
@@ -1672,11 +1732,14 @@ def run_describe(table_name, impala_shell, impala_opts):
         )
 
     cols = []
+    types_dict = {}
     for raw_line in stdout.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        first = line.split(",", 1)[0].strip()
+        parts = line.split(",")
+        first = parts[0].strip()
+        second = parts[1].strip() if len(parts) > 1 else "unknown"
         if not first:
             continue
         if first.startswith("#"):
@@ -1686,13 +1749,14 @@ def run_describe(table_name, impala_shell, impala_opts):
         if first.startswith("+") or first.startswith("|"):
             continue
         cols.append(first)
+        types_dict[first] = second
 
     if not cols:
         raise RuntimeError(
             "DESCRIBE no devolvio columnas para {0}. "
             "Verifica permisos, nombre de tabla y conexion de impala-shell.".format(table_name)
         )
-    return cols
+    return cols, types_dict
 
 
 def shared_columns(cols_a, cols_b):
@@ -1735,12 +1799,12 @@ def choose_auto_key_columns(common_cols):
 
 def build_key_expr(key_columns):
     parts = ["coalesce(cast({0} as string), '__NULL__')".format(col) for col in key_columns]
-    return "concat_ws('|', " + ", ".join(parts) + ")"
+    return "concat_ws('|||', " + ", ".join(parts) + ")"
 
 
 def build_row_expr(columns):
     parts = ["coalesce(cast({0} as string), '__NULL__')".format(col) for col in columns]
-    return "concat_ws('|', " + ", ".join(parts) + ")"
+    return "concat_ws('|||', " + ", ".join(parts) + ")"
 
 
 def metric_block(pair_name, original_table, refactor_table, key_columns, compare_columns, sample_size=DEFAULT_SAMPLE_SIZE):
@@ -1758,10 +1822,12 @@ def metric_block(pair_name, original_table, refactor_table, key_columns, compare
     block.append("ba_key AS (SELECT cast(count(*) as bigint) AS value FROM b LEFT ANTI JOIN a ON b.__cmp_key = a.__cmp_key),")
     block.append("a_rows AS (SELECT __row_text, cast(count(*) as bigint) AS cnt FROM a GROUP BY __row_text),")
     block.append("b_rows AS (SELECT __row_text, cast(count(*) as bigint) AS cnt FROM b GROUP BY __row_text),")
-    block.append("ab_rows AS (SELECT cast(count(*) as bigint) AS value FROM a_rows LEFT ANTI JOIN b_rows ON a_rows.__row_text = b_rows.__row_text AND a_rows.cnt = b_rows.cnt),")
-    block.append("ba_rows AS (SELECT cast(count(*) as bigint) AS value FROM b_rows LEFT ANTI JOIN a_rows ON b_rows.__row_text = a_rows.__row_text AND b_rows.cnt = a_rows.cnt),")
-    block.append("a_only_sample AS (SELECT a.__cmp_key, a.__row_text FROM a LEFT ANTI JOIN b ON a.__cmp_key = b.__cmp_key LIMIT {0}),".format(int(sample_size)))
-    block.append("b_only_sample AS (SELECT b.__cmp_key, b.__row_text FROM b LEFT ANTI JOIN a ON b.__cmp_key = a.__cmp_key LIMIT {0}),".format(int(sample_size)))
+    block.append("a_diff_rows AS (SELECT a_rows.__row_text FROM a_rows LEFT ANTI JOIN b_rows ON a_rows.__row_text = b_rows.__row_text AND a_rows.cnt = b_rows.cnt),")
+    block.append("b_diff_rows AS (SELECT b_rows.__row_text FROM b_rows LEFT ANTI JOIN a_rows ON b_rows.__row_text = a_rows.__row_text AND b_rows.cnt = a_rows.cnt),")
+    block.append("ab_rows AS (SELECT cast(count(*) as bigint) AS value FROM a_diff_rows),")
+    block.append("ba_rows AS (SELECT cast(count(*) as bigint) AS value FROM b_diff_rows),")
+    block.append("a_only_sample AS (SELECT a.__cmp_key, a.__row_text FROM a LEFT SEMI JOIN a_diff_rows ON a.__row_text = a_diff_rows.__row_text ORDER BY a.__cmp_key LIMIT {0}),".format(int(sample_size)))
+    block.append("b_only_sample AS (SELECT b.__cmp_key, b.__row_text FROM b LEFT SEMI JOIN b_diff_rows ON b.__row_text = b_diff_rows.__row_text ORDER BY b.__cmp_key LIMIT {0}),".format(int(sample_size)))
     block.append("a_hash AS (SELECT cast(coalesce(sum(cast(fnv_hash(__row_text) as bigint)), 0) as bigint) AS value FROM a),")
     block.append("b_hash AS (SELECT cast(coalesce(sum(cast(fnv_hash(__row_text) as bigint)), 0) as bigint) AS value FROM b),")
     block.append("a_total AS (SELECT cast(count(*) as bigint) AS value FROM a),")
@@ -1978,6 +2044,357 @@ def run_step2_sql_mode(original_query, refactor_query, args, metrics_rows, impal
     log_info("STEP 2 COMPLETED: comparacion read-only multi-run finalizada")
     return step2_summary, ""
 
+def export_table_to_csv(table_name, csv_path, impala_shell, impala_opts):
+    cmd = [impala_shell]
+    if impala_opts:
+        cmd.extend(shlex.split(to_text(impala_opts)))
+    cmd.extend([
+        "-B",
+        "--output_delimiter=,",
+        "--print_header",
+        "-q", "SELECT * FROM {0}".format(table_name),
+        "-o", csv_path
+    ])
+    log_info("Exportando {0} a {1}".format(table_name, csv_path))
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        log_warn("Fallo al exportar {0} a CSV: {1}".format(table_name, stderr))
+
+
+
+def run_validation_iteration(args, use_sql_mode, execute_generated_sql, current_original_query, current_refactor_query, current_pair_name, current_output_path, report_path, is_append):
+        output_path = current_output_path
+
+        temp_tables = []
+        metrics_rows = []
+        rows = []
+        original_query = ""
+        refactor_query = ""
+
+        step1_summary = {
+            "status": "SKIPPED",
+            "all_pass": False,
+            "pairs": [],
+            "reason": "Step 1 aun no ejecutado",
+        }
+        step2_summary = {
+            "status": "SKIPPED",
+            "reason": "Step 2 aun no ejecutado",
+            "method": "direct_query_elastic_lookup",
+            "policy": "alternating",
+            "runs": args.step2_runs,
+            "original_metrics": None,
+            "refactor_metrics": None,
+            "original_runs": [],
+            "refactor_runs": [],
+            "original_rowcount": "",
+            "refactor_rowcount": "",
+        }
+        comparison_samples_by_pair = {}
+
+        impala_web_url = ""
+        log_info(
+            "Step 2 usara metricas de Elasticsearch (indice={0}, env_file={1}, wait={2}s).".format(
+                args.elastic_index,
+                args.elastic_env_file,
+                args.elastic_wait_sec,
+            )
+        )
+
+        execute_generated_sql = (args.run or use_sql_mode) and not args.skip_step1
+        if args.skip_step1:
+            log_info("STEP 1 sera omitido por parametro --skip-step1")
+        log_info("Ejecucion de SQL generado: {0}".format("si" if execute_generated_sql else "no"))
+
+        try:
+            if use_sql_mode:
+                log_info("Iniciando modo SQL con archivos: original={0}, refactor={1}".format(args.original_sql, args.refactor_sql))
+                key_columns = split_list(args.key_columns)
+                pair_name = current_pair_name
+
+                log_info("Cargando y validando query SQL original")
+                original_query = current_original_query
+                log_info("Cargando y validando query SQL refactor")
+                refactor_query = current_refactor_query
+
+                if not args.skip_step1:
+                    original_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "original")
+                    refactor_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "refactor")
+                    log_info("Tabla temporal original: {0}".format(original_table))
+                    log_info("Tabla temporal refactor: {0}".format(refactor_table))
+
+                    create_original_sql = u"CREATE TABLE {0} AS {1}".format(original_table, original_query)
+                    create_original_result = run_impala_query_timed(
+                        create_original_sql,
+                        args.impala_shell,
+                        args.impala_opts,
+                        show_profiles=True,
+                        step_name="create_original_temp_table",
+                    )
+                    metrics_rows.append(
+                        build_step_metrics(
+                            "create_original_temp_table",
+                            create_original_result,
+                            impala_web_url,
+                            args.elastic_timeout,
+                            allow_api=False,
+                        )
+                    )
+                    if create_original_result["returncode"] != 0:
+                        raise RuntimeError(format_impala_error("CREATE TABLE original", create_original_result))
+                    temp_tables.append(original_table)
+
+                    create_refactor_sql = u"CREATE TABLE {0} AS {1}".format(refactor_table, refactor_query)
+                    create_refactor_result = run_impala_query_timed(
+                        create_refactor_sql,
+                        args.impala_shell,
+                        args.impala_opts,
+                        show_profiles=True,
+                        step_name="create_refactor_temp_table",
+                    )
+                    metrics_rows.append(
+                        build_step_metrics(
+                            "create_refactor_temp_table",
+                            create_refactor_result,
+                            impala_web_url,
+                            args.elastic_timeout,
+                            allow_api=False,
+                        )
+                    )
+                    if create_refactor_result["returncode"] != 0:
+                        raise RuntimeError(format_impala_error("CREATE TABLE refactor", create_refactor_result))
+                    temp_tables.append(refactor_table)
+
+                    log_info("Descubriendo columnas via DESCRIBE para tablas temporales")
+                    cols_a, types_a = run_describe(original_table, args.impala_shell, args.impala_opts)
+                    cols_b, types_b = run_describe(refactor_table, args.impala_shell, args.impala_opts)
+                    common_cols = shared_columns(cols_a, cols_b)
+                    if not common_cols:
+                        raise ValueError(
+                            "El par {0} no tiene columnas en comun entre {1} y {2}.".format(
+                                pair_name, original_table, refactor_table
+                            )
+                        )
+
+                    if args.auto_columns and not key_columns:
+                        key_columns = choose_auto_key_columns(common_cols)
+
+                    if not key_columns:
+                        raise ValueError(
+                            "El par {0} no tiene key_columns. Usa --key-columns o --auto-columns.".format(pair_name)
+                        )
+
+                    metadata = {"types_a": types_a, "types_b": types_b, "common_cols": common_cols, "key_columns": key_columns}
+                    rows = [(pair_name, original_table, refactor_table, key_columns, common_cols, metadata)]
+            else:
+                log_info("Iniciando modo pairs con CSV: {0}".format(args.pairs))
+                rows = build_rows_from_pairs_csv(args)
+
+            if not args.skip_step1:
+                sql_parts = [
+                    "-- SQL generado automaticamente para validacion funcional",
+                    "-- Metricas: count, anti-join por clave, hash y comparacion estricta por fila completa con multiplicidad.",
+                    "-- Nota: para hash y validacion estricta se usan las columnas en comun detectadas por DESCRIBE.",
+                    "",
+                ]
+
+                for row_data in rows:
+                    sql_parts.append(
+                        metric_block(
+                            row_data[0],
+                            row_data[1],
+                            row_data[2],
+                            row_data[3],
+                            row_data[4],
+                            sample_size=DEFAULT_SAMPLE_SIZE,
+                        )
+                    )
+
+                ensure_parent_dir(output_path)
+                write_text_file(output_path, "\n".join(sql_parts))
+                log_info("SQL generado en {0}".format(output_path))
+
+            if execute_generated_sql:
+                log_info("Ejecutando SQL de comparacion en Impala")
+                compare_result = run_impala_file_timed(
+                    output_path,
+                    args.impala_shell,
+                    args.impala_opts,
+                    show_profiles=False,
+                    step_name="execute_comparison_sql",
+                    delimited=True,
+                )
+                metrics_rows.append(
+                    build_step_metrics(
+                        "execute_comparison_sql",
+                        compare_result,
+                        impala_web_url,
+                        args.elastic_timeout,
+                        allow_api=False,
+                    )
+                )
+
+                if args.result_output:
+                    ensure_parent_dir(args.result_output)
+                    write_text_file(args.result_output, compare_result["stdout"])
+
+                comparison_metrics_by_pair, comparison_samples_by_pair = parse_comparison_output(compare_result.get("stdout", ""))
+                step1_summary = evaluate_step1_results(rows, comparison_metrics_by_pair)
+
+                if compare_result["returncode"] != 0:
+                    step1_summary["status"] = "ERROR"
+                    step1_summary["all_pass"] = False
+                    step1_summary["reason"] = "Error ejecutando SQL de comparacion"
+                    step2_summary["status"] = "SKIPPED"
+                    step2_summary["reason"] = "Step 2 omitido por error de ejecucion en Step 1"
+                    raise RuntimeError(format_impala_error("ejecucion SQL de comparacion", compare_result))
+
+                log_info("SQL ejecutado en Impala")
+                if args.result_output:
+                    log_info("Resultado guardado en {0}".format(args.result_output))
+
+                if step1_summary.get("all_pass"):
+                    log_info("STEP 1 PASS: STRICT_100_RESULT=OK para todos los pares")
+                    if use_sql_mode:
+                        if args.skip_step2:
+                            step2_summary["status"] = "SKIPPED"
+                            step2_summary["reason"] = "Step 2 omitido por parametro --skip-step2"
+                            log_info("STEP 2 SKIPPED: omitido por parametro --skip-step2")
+                        else:
+                            step2_summary, step2_error = run_step2_sql_mode(
+                                original_query,
+                                refactor_query,
+                                args,
+                                metrics_rows,
+                                impala_web_url,
+                            )
+                            if step2_error:
+                                raise RuntimeError(step2_error)
+                    else:
+                        step2_summary["status"] = "SKIPPED"
+                        step2_summary["reason"] = "Step 2 read-only solo aplica para modo sql"
+                        log_warn("STEP 2 SKIPPED: modo pairs")
+                else:
+                    step1_summary["reason"] = "Al menos un par no cumple STRICT_100_RESULT=OK"
+                    step2_summary["status"] = "SKIPPED"
+                    step2_summary["reason"] = "Step 1 FAIL: se omite Step 2"
+                    log_warn("STEP 1 FAIL: se omite Step 2")
+                
+                    # Export data to CSV for failed checks
+                    out_dir = os.path.dirname(args.result_output) if args.result_output else "."
+                    for row in rows:
+                        pair_name, original_table, refactor_table = row[0], row[1], row[2]
+                        # Check if this pair actually failed
+                        pair_failed = False
+                        for p in step1_summary.get("pairs", []):
+                            if p.get("pair_name") == pair_name and p.get("status") != "PASS":
+                                pair_failed = True
+                                break
+                    
+                        if pair_failed:
+                            orig_csv = os.path.join(out_dir, "{0}_original.csv".format(pair_name))
+                            ref_csv = os.path.join(out_dir, "{0}_refactor.csv".format(pair_name))
+                            export_table_to_csv(original_table, orig_csv, args.impala_shell, args.impala_opts)
+                            export_table_to_csv(refactor_table, ref_csv, args.impala_shell, args.impala_opts)
+            else:
+                if args.skip_step1 and use_sql_mode:
+                    log_info("STEP 1 SKIPPED: se ejecuta Step 2 directamente")
+                    step1_summary = {
+                        "status": "SKIPPED",
+                        "all_pass": False,
+                        "pairs": [],
+                        "reason": "Step 1 omitido por --skip-step1",
+                    }
+                    step2_summary, step2_error = run_step2_sql_mode(
+                        original_query,
+                        refactor_query,
+                        args,
+                        metrics_rows,
+                        impala_web_url,
+                    )
+                    if step2_error:
+                        raise RuntimeError(step2_error)
+                else:
+                    log_info("SQL no ejecutado (usa --run)")
+                    step1_summary = {
+                        "status": "SKIPPED",
+                        "all_pass": False,
+                        "pairs": [],
+                        "reason": "No se ejecuto SQL de comparacion",
+                    }
+                    step2_summary = {
+                        "status": "SKIPPED",
+                        "reason": "Step 2 requiere que Step 1 se ejecute",
+                        "method": "direct_query_elastic_lookup",
+                        "policy": "alternating",
+                        "runs": args.step2_runs,
+                        "original_metrics": None,
+                        "refactor_metrics": None,
+                        "original_runs": [],
+                        "refactor_runs": [],
+                        "original_rowcount": "",
+                        "refactor_rowcount": "",
+                    }
+        finally:
+            if use_sql_mode and temp_tables:
+                log_info("Iniciando cleanup de tablas temporales")
+                cleanup_errors = []
+                for temp_table in temp_tables:
+                    drop_sql = "DROP TABLE IF EXISTS {0}".format(temp_table)
+                    drop_result = run_impala_query_timed(
+                        drop_sql,
+                        args.impala_shell,
+                        args.impala_opts,
+                        show_profiles=False,
+                        step_name="drop_temp_table:{0}".format(temp_table),
+                    )
+                    metrics_rows.append(
+                        build_step_metrics(
+                            "drop_temp_table:{0}".format(temp_table),
+                            drop_result,
+                            impala_web_url,
+                            args.elastic_timeout,
+                            allow_api=False,
+                        )
+                    )
+                    if drop_result["returncode"] != 0:
+                        cleanup_errors.append(format_impala_error("DROP TABLE {0}".format(temp_table), drop_result))
+
+                if cleanup_errors:
+                    log_warn("hubo errores en cleanup de temporales")
+                    for err in cleanup_errors:
+                        write_stdout_line(err)
+                else:
+                    log_info("tablas temporales eliminadas")
+
+            try:
+                print_metrics_summary(metrics_rows)
+                if args.metrics_json:
+                    ensure_parent_dir(args.metrics_json)
+                    write_text_file(args.metrics_json, json.dumps(metrics_rows, indent=2, sort_keys=True))
+                    log_info("metricas guardadas en {0}".format(args.metrics_json))
+            except Exception as exc:
+                log_warn("no se pudieron emitir metricas: {0}".format(exc))
+
+            try:
+                pairs_metadata = {row[0]: row[5] for row in rows} if rows else {}
+                report_text = build_human_report_text(
+                    "sql" if use_sql_mode else "pairs",
+                    step1_summary,
+                    comparison_samples_by_pair,
+                    step2_summary,
+                    DEFAULT_SAMPLE_SIZE,
+                    original_sql_file=args.original_sql if use_sql_mode else "",
+                    refactor_sql_file=args.refactor_sql if use_sql_mode else "",
+                    pairs_metadata=pairs_metadata,
+                )
+                ensure_parent_dir(report_path)
+                write_text_file(report_path, report_text, append=is_append)
+                log_info("reporte humano guardado en {0}".format(report_path))
+            except Exception as exc:
+                log_warn("no se pudo generar el reporte humano: {0}".format(exc))
+
 
 def main():
     parser = argparse.ArgumentParser(description="Valida equivalencia entre tablas (modo CSV) o queries (modo SQL).")
@@ -2070,6 +2487,18 @@ def main():
         action="store_true",
         help="Omite Step 2 y solo ejecuta la validacion (Step 1).",
     )
+    parser.add_argument(
+        "--resource-pool",
+        default="",
+        help="Pool de recursos de Impala para ejecutar las queries (agrega -Q REQUEST_POOL=...).",
+    )
+    parser.add_argument(
+        "--varreplace",
+        nargs=2,
+        action="append",
+        metavar=("VAR_NAME", "VALUE"),
+        help="Reemplaza variables en formato $VAR o ${VAR} con VALUE.",
+    )
     parser.set_defaults(auto_columns=True)
     args = parser.parse_args()
 
@@ -2081,6 +2510,10 @@ def main():
         raise ValueError("--elastic-timeout debe ser mayor que 0.")
 
     args.impala_shell = resolve_impala_shell_command(args.impala_shell)
+
+    if args.resource_pool:
+        pool_opt = '-Q REQUEST_POOL="{0}"'.format(args.resource_pool.strip())
+        args.impala_opts = "{0} {1}".format(args.impala_opts, pool_opt).strip()
 
     has_original_sql = bool(args.original_sql.strip())
     has_refactor_sql = bool(args.refactor_sql.strip())
@@ -2106,323 +2539,80 @@ def main():
 
     log_info("Modo de ejecucion seleccionado: {0}".format("sql" if use_sql_mode else "pairs"))
 
-    output_path = args.output
+    execute_generated_sql = (args.run or use_sql_mode) and not args.skip_step1
+    if args.skip_step1:
+        log_info("STEP 1 sera omitido por parametro --skip-step1")
+    log_info("Ejecucion de SQL generado: {0}".format("si" if execute_generated_sql else "no"))
+
+    original_query_raw = ""
+    refactor_query_raw = ""
+    entidades = [None]
+    
+    if use_sql_mode:
+        log_info("Cargando y validando queries...")
+        original_query_raw = load_sql_query_for_ctas(args.original_sql)
+        refactor_query_raw = load_sql_query_for_ctas(args.refactor_sql)
+
+        if args.varreplace:
+            for var_name, var_value in args.varreplace:
+                pattern = r'\$\{?' + re.escape(var_name) + r'\}?'
+                original_query_raw = re.sub(pattern, var_value, original_query_raw)
+                refactor_query_raw = re.sub(pattern, var_value, refactor_query_raw)
+
+        original_query_raw = re.sub(r'\$\{?SUBENTORNO\}?', 'pr', original_query_raw)
+        refactor_query_raw = re.sub(r'\$\{?SUBENTORNO\}?', 'pr', refactor_query_raw)
+
+        has_entidad = bool(re.search(r'\$\{?ENTIDAD\}?', original_query_raw) or re.search(r'\$\{?ENTIDAD\}?', refactor_query_raw))
+        if has_entidad:
+            entidades = ["bsj", "bsc", "ber", "bsf"]
+            
     report_path = (args.human_report or "").strip()
     if not report_path:
         if use_sql_mode:
             report_path = "comparison_report_{0}.txt".format(args.pair_name.strip() or "sql_file_pair")
         else:
             report_path = DEFAULT_HUMAN_REPORT_PATH
-    temp_tables = []
-    metrics_rows = []
-    rows = []
-    original_query = ""
-    refactor_query = ""
+            
+    if os.path.exists(report_path):
+        try:
+            os.remove(report_path)
+        except OSError:
+            pass
 
-    step1_summary = {
-        "status": "SKIPPED",
-        "all_pass": False,
-        "pairs": [],
-        "reason": "Step 1 aun no ejecutado",
-    }
-    step2_summary = {
-        "status": "SKIPPED",
-        "reason": "Step 2 aun no ejecutado",
-        "method": "direct_query_elastic_lookup",
-        "policy": "alternating",
-        "runs": args.step2_runs,
-        "original_metrics": None,
-        "refactor_metrics": None,
-        "original_runs": [],
-        "refactor_runs": [],
-        "original_rowcount": "",
-        "refactor_rowcount": "",
-    }
-    comparison_samples_by_pair = {}
-
-    impala_web_url = ""
-    log_info(
-        "Step 2 usara metricas de Elasticsearch (indice={0}, env_file={1}, wait={2}s).".format(
-            args.elastic_index,
-            args.elastic_env_file,
-            args.elastic_wait_sec,
+    for i_ent, entidad in enumerate(entidades):
+        current_original_query = original_query_raw
+        current_refactor_query = refactor_query_raw
+        current_pair_name = args.pair_name.strip() or "sql_file_pair"
+        current_output_path = args.output
+        
+        if entidad:
+            current_original_query = re.sub(r'\$\{?ENTIDAD\}?', entidad, current_original_query)
+            current_refactor_query = re.sub(r'\$\{?ENTIDAD\}?', entidad, current_refactor_query)
+            current_pair_name = "{0}_{1}".format(current_pair_name, entidad)
+            # Prefix output path
+            base, ext = os.path.splitext(current_output_path)
+            current_output_path = "{0}_{1}{2}".format(base, entidad, ext)
+            log_info("=" * 80)
+            log_info("EJECUTANDO VALIDACION PARA ENTIDAD: {0}".format(entidad.upper()))
+            log_info("=" * 80)
+            
+        is_append = (i_ent > 0)
+        
+        # Override report_path in args temporarily? No, run_validation_iteration uses local vars
+        # But wait! run_validation_iteration still evaluates report_path from args if we don't pass it!
+        # Ah! report_path is evaluated inside execution_code!
+        
+        run_validation_iteration(
+            args, 
+            use_sql_mode, 
+            execute_generated_sql, 
+            current_original_query, 
+            current_refactor_query, 
+            current_pair_name, 
+            current_output_path, 
+            report_path,
+            is_append
         )
-    )
-
-    execute_generated_sql = (args.run or use_sql_mode) and not args.skip_step1
-    if args.skip_step1:
-        log_info("STEP 1 sera omitido por parametro --skip-step1")
-    log_info("Ejecucion de SQL generado: {0}".format("si" if execute_generated_sql else "no"))
-
-    try:
-        if use_sql_mode:
-            log_info("Iniciando modo SQL con archivos: original={0}, refactor={1}".format(args.original_sql, args.refactor_sql))
-            key_columns = split_list(args.key_columns)
-            pair_name = args.pair_name.strip() or "sql_file_pair"
-
-            log_info("Cargando y validando query SQL original")
-            original_query = load_sql_query_for_ctas(args.original_sql)
-            log_info("Cargando y validando query SQL refactor")
-            refactor_query = load_sql_query_for_ctas(args.refactor_sql)
-
-            if not args.skip_step1:
-                original_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "original")
-                refactor_table = make_temp_table_name(args.temp_db, args.temp_prefix, pair_name, "refactor")
-                log_info("Tabla temporal original: {0}".format(original_table))
-                log_info("Tabla temporal refactor: {0}".format(refactor_table))
-
-                create_original_sql = u"CREATE TABLE {0} AS {1}".format(original_table, original_query)
-                create_original_result = run_impala_query_timed(
-                    create_original_sql,
-                    args.impala_shell,
-                    args.impala_opts,
-                    show_profiles=True,
-                    step_name="create_original_temp_table",
-                )
-                metrics_rows.append(
-                    build_step_metrics(
-                        "create_original_temp_table",
-                        create_original_result,
-                        impala_web_url,
-                        args.elastic_timeout,
-                        allow_api=False,
-                    )
-                )
-                if create_original_result["returncode"] != 0:
-                    raise RuntimeError(format_impala_error("CREATE TABLE original", create_original_result))
-                temp_tables.append(original_table)
-
-                create_refactor_sql = u"CREATE TABLE {0} AS {1}".format(refactor_table, refactor_query)
-                create_refactor_result = run_impala_query_timed(
-                    create_refactor_sql,
-                    args.impala_shell,
-                    args.impala_opts,
-                    show_profiles=True,
-                    step_name="create_refactor_temp_table",
-                )
-                metrics_rows.append(
-                    build_step_metrics(
-                        "create_refactor_temp_table",
-                        create_refactor_result,
-                        impala_web_url,
-                        args.elastic_timeout,
-                        allow_api=False,
-                    )
-                )
-                if create_refactor_result["returncode"] != 0:
-                    raise RuntimeError(format_impala_error("CREATE TABLE refactor", create_refactor_result))
-                temp_tables.append(refactor_table)
-
-                log_info("Descubriendo columnas via DESCRIBE para tablas temporales")
-                cols_a = run_describe(original_table, args.impala_shell, args.impala_opts)
-                cols_b = run_describe(refactor_table, args.impala_shell, args.impala_opts)
-                common_cols = shared_columns(cols_a, cols_b)
-                if not common_cols:
-                    raise ValueError(
-                        "El par {0} no tiene columnas en comun entre {1} y {2}.".format(
-                            pair_name, original_table, refactor_table
-                        )
-                    )
-
-                if args.auto_columns and not key_columns:
-                    key_columns = choose_auto_key_columns(common_cols)
-
-                if not key_columns:
-                    raise ValueError(
-                        "El par {0} no tiene key_columns. Usa --key-columns o --auto-columns.".format(pair_name)
-                    )
-
-                rows = [(pair_name, original_table, refactor_table, key_columns, common_cols)]
-        else:
-            log_info("Iniciando modo pairs con CSV: {0}".format(args.pairs))
-            rows = build_rows_from_pairs_csv(args)
-
-        if not args.skip_step1:
-            sql_parts = [
-                "-- SQL generado automaticamente para validacion funcional",
-                "-- Metricas: count, anti-join por clave, hash y comparacion estricta por fila completa con multiplicidad.",
-                "-- Nota: para hash y validacion estricta se usan las columnas en comun detectadas por DESCRIBE.",
-                "",
-            ]
-
-            for row_data in rows:
-                sql_parts.append(
-                    metric_block(
-                        row_data[0],
-                        row_data[1],
-                        row_data[2],
-                        row_data[3],
-                        row_data[4],
-                        sample_size=DEFAULT_SAMPLE_SIZE,
-                    )
-                )
-
-            ensure_parent_dir(output_path)
-            write_text_file(output_path, "\n".join(sql_parts))
-            log_info("SQL generado en {0}".format(output_path))
-
-        if execute_generated_sql:
-            log_info("Ejecutando SQL de comparacion en Impala")
-            compare_result = run_impala_file_timed(
-                output_path,
-                args.impala_shell,
-                args.impala_opts,
-                show_profiles=False,
-                step_name="execute_comparison_sql",
-                delimited=True,
-            )
-            metrics_rows.append(
-                build_step_metrics(
-                    "execute_comparison_sql",
-                    compare_result,
-                    impala_web_url,
-                    args.elastic_timeout,
-                    allow_api=False,
-                )
-            )
-
-            if args.result_output:
-                ensure_parent_dir(args.result_output)
-                write_text_file(args.result_output, compare_result["stdout"])
-
-            comparison_metrics_by_pair, comparison_samples_by_pair = parse_comparison_output(compare_result.get("stdout", ""))
-            step1_summary = evaluate_step1_results(rows, comparison_metrics_by_pair)
-
-            if compare_result["returncode"] != 0:
-                step1_summary["status"] = "ERROR"
-                step1_summary["all_pass"] = False
-                step1_summary["reason"] = "Error ejecutando SQL de comparacion"
-                step2_summary["status"] = "SKIPPED"
-                step2_summary["reason"] = "Step 2 omitido por error de ejecucion en Step 1"
-                raise RuntimeError(format_impala_error("ejecucion SQL de comparacion", compare_result))
-
-            log_info("SQL ejecutado en Impala")
-            if args.result_output:
-                log_info("Resultado guardado en {0}".format(args.result_output))
-
-            if step1_summary.get("all_pass"):
-                log_info("STEP 1 PASS: STRICT_100_RESULT=OK para todos los pares")
-                if use_sql_mode:
-                    if args.skip_step2:
-                        step2_summary["status"] = "SKIPPED"
-                        step2_summary["reason"] = "Step 2 omitido por parametro --skip-step2"
-                        log_info("STEP 2 SKIPPED: omitido por parametro --skip-step2")
-                    else:
-                        step2_summary, step2_error = run_step2_sql_mode(
-                            original_query,
-                            refactor_query,
-                            args,
-                            metrics_rows,
-                            impala_web_url,
-                        )
-                        if step2_error:
-                            raise RuntimeError(step2_error)
-                else:
-                    step2_summary["status"] = "SKIPPED"
-                    step2_summary["reason"] = "Step 2 read-only solo aplica para modo sql"
-                    log_warn("STEP 2 SKIPPED: modo pairs")
-            else:
-                step1_summary["reason"] = "Al menos un par no cumple STRICT_100_RESULT=OK"
-                step2_summary["status"] = "SKIPPED"
-                step2_summary["reason"] = "Step 1 FAIL: se omite Step 2"
-                log_warn("STEP 1 FAIL: se omite Step 2")
-        else:
-            if args.skip_step1 and use_sql_mode:
-                log_info("STEP 1 SKIPPED: se ejecuta Step 2 directamente")
-                step1_summary = {
-                    "status": "SKIPPED",
-                    "all_pass": False,
-                    "pairs": [],
-                    "reason": "Step 1 omitido por --skip-step1",
-                }
-                step2_summary, step2_error = run_step2_sql_mode(
-                    original_query,
-                    refactor_query,
-                    args,
-                    metrics_rows,
-                    impala_web_url,
-                )
-                if step2_error:
-                    raise RuntimeError(step2_error)
-            else:
-                log_info("SQL no ejecutado (usa --run)")
-                step1_summary = {
-                    "status": "SKIPPED",
-                    "all_pass": False,
-                    "pairs": [],
-                    "reason": "No se ejecuto SQL de comparacion",
-                }
-                step2_summary = {
-                    "status": "SKIPPED",
-                    "reason": "Step 2 requiere que Step 1 se ejecute",
-                    "method": "direct_query_elastic_lookup",
-                    "policy": "alternating",
-                    "runs": args.step2_runs,
-                    "original_metrics": None,
-                    "refactor_metrics": None,
-                    "original_runs": [],
-                    "refactor_runs": [],
-                    "original_rowcount": "",
-                    "refactor_rowcount": "",
-                }
-    finally:
-        if use_sql_mode and temp_tables:
-            log_info("Iniciando cleanup de tablas temporales")
-            cleanup_errors = []
-            for temp_table in temp_tables:
-                drop_sql = "DROP TABLE IF EXISTS {0}".format(temp_table)
-                drop_result = run_impala_query_timed(
-                    drop_sql,
-                    args.impala_shell,
-                    args.impala_opts,
-                    show_profiles=False,
-                    step_name="drop_temp_table:{0}".format(temp_table),
-                )
-                metrics_rows.append(
-                    build_step_metrics(
-                        "drop_temp_table:{0}".format(temp_table),
-                        drop_result,
-                        impala_web_url,
-                        args.elastic_timeout,
-                        allow_api=False,
-                    )
-                )
-                if drop_result["returncode"] != 0:
-                    cleanup_errors.append(format_impala_error("DROP TABLE {0}".format(temp_table), drop_result))
-
-            if cleanup_errors:
-                log_warn("hubo errores en cleanup de temporales")
-                for err in cleanup_errors:
-                    write_stdout_line(err)
-            else:
-                log_info("tablas temporales eliminadas")
-
-        try:
-            print_metrics_summary(metrics_rows)
-            if args.metrics_json:
-                ensure_parent_dir(args.metrics_json)
-                write_text_file(args.metrics_json, json.dumps(metrics_rows, indent=2, sort_keys=True))
-                log_info("metricas guardadas en {0}".format(args.metrics_json))
-        except Exception as exc:
-            log_warn("no se pudieron emitir metricas: {0}".format(exc))
-
-        try:
-            report_text = build_human_report_text(
-                "sql" if use_sql_mode else "pairs",
-                step1_summary,
-                comparison_samples_by_pair,
-                step2_summary,
-                DEFAULT_SAMPLE_SIZE,
-                original_sql_file=args.original_sql if use_sql_mode else "",
-                refactor_sql_file=args.refactor_sql if use_sql_mode else "",
-            )
-            ensure_parent_dir(report_path)
-            write_text_file(report_path, report_text)
-            log_info("reporte humano guardado en {0}".format(report_path))
-        except Exception as exc:
-            log_warn("no se pudo generar el reporte humano: {0}".format(exc))
-
-
 if __name__ == "__main__":
     try:
         main()
